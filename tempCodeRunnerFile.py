@@ -1,0 +1,1 @@
+save_path = f"models/checkpoints/{CONFIG['model_type']}_best.pt"

@@ -1,0 +1,14 @@
+# Ignore all csv & pt files
+*.csv
+*.pt
+
+# Python virtual environment
+venv/
+.venv/
+env/
+scripts/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
