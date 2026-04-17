@@ -122,25 +122,44 @@ class FakeNewsEvaluator:
         )
 
     def _forward(self, batch: dict) -> torch.Tensor:
-        """
-        Run a single forward pass, routing inputs correctly per model type.
+        """Run a single forward pass, routing inputs correctly per model type.
+        
+        Handles three batch formats:
+        - XLM-RoBERTa: input_ids + attention_mask
+        - MuRIL: input_ids + attention_mask + token_type_ids (optional)
+        - Ensemble: xlmr_ids/mask + muril_ids/mask + muril_tti (from dataset dual tokenization)
+        
         Returns probability tensor [batch, num_classes].
         """
-        input_ids      = batch["input_ids"].to(self.device)
-        attention_mask = batch["attention_mask"].to(self.device)
+        with torch.no_grad():
+            if self.model_type == "ensemble":
+                # Ensemble: extract keys from dual tokenization batch format
+                xlmr_ids = batch["xlmr_ids"].to(self.device)
+                xlmr_mask = batch["xlmr_mask"].to(self.device)
+                muril_ids = batch["muril_ids"].to(self.device)
+                muril_mask = batch["muril_mask"].to(self.device)
+                muril_tti = batch.get("muril_tti")
+                if muril_tti is not None:
+                    muril_tti = muril_tti.to(self.device)
+                
+                logits = self.model(xlmr_ids, xlmr_mask, muril_ids, muril_mask, muril_tti)
+            
+            elif self.model_type == "xlm-roberta":
+                # XLM-RoBERTa: no token_type_ids
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                logits = self.model(input_ids, attention_mask)
+            
+            else:  # muril
+                # MuRIL: optional token_type_ids
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                token_type_ids = batch.get("token_type_ids")
+                if token_type_ids is not None:
+                    token_type_ids = token_type_ids.to(self.device)
+                logits = self.model(input_ids, attention_mask, token_type_ids)
 
-        token_type_ids = None
-        if self.model_type in ("muril", "ensemble"):
-            raw_tti = batch.get("token_type_ids")
-            if isinstance(raw_tti, torch.Tensor):
-                token_type_ids = raw_tti.to(self.device)
-
-        if self.model_type == "xlm-roberta":
-            logits = self.model(input_ids, attention_mask)
-        else:
-            logits = self.model(input_ids, attention_mask, token_type_ids)
-
-        # Ensemble weighted_avg/max outputs log-probabilities
+        # Convert log-probs to probs if ensemble uses weighted_avg/max
         if (
             isinstance(self.model, EnsembleFakeNewsClassifier)
             and self.model.ensemble_method in ("weighted_avg", "max")
@@ -393,7 +412,7 @@ if __name__ == "__main__":
     TOKENIZER_MAP = {
         "xlm-roberta": "xlm-roberta-base",
         "muril":       "google/muril-base-cased",
-        "ensemble":    "google/muril-base-cased",
+        "ensemble":    "ensemble",
     }
     tokenizer_name = TOKENIZER_MAP[model_type]
 

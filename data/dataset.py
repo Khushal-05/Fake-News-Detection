@@ -90,10 +90,14 @@ class MultilingualFakeNewsDataset(Dataset):
         self.tokenizer_name = tokenizer_name
 
         # ── Load tokenizer ────────────────────────────────────────────────── #
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_name,
-            use_fast=True,
-        )
+
+        self.is_ensemble = (tokenizer_name == "ensemble")
+        if self.is_ensemble:
+            self.tokenizer_xlmr = AutoTokenizer.from_pretrained("xlm-roberta-base")
+            self.tokenizer_muril = AutoTokenizer.from_pretrained("google/muril-base-cased")
+            self.tokenizer = None
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
 
     def __len__(self) -> int:
         return len(self.texts)
@@ -103,6 +107,23 @@ class MultilingualFakeNewsDataset(Dataset):
         label    = self.labels[idx]
         language = self.languages[idx]
 
+        if self.is_ensemble:
+            # Tokenize for XLM-R
+            enc_xlmr = self.tokenizer_xlmr(text, max_length=self.max_length, 
+                                           padding="max_length", truncation=True, return_tensors="pt")
+            # Tokenize for MuRIL
+            enc_muril = self.tokenizer_muril(text, max_length=self.max_length, 
+                                             padding="max_length", truncation=True, return_tensors="pt")
+            
+            return {
+                "xlmr_ids": enc_xlmr["input_ids"].squeeze(0),
+                "xlmr_mask": enc_xlmr["attention_mask"].squeeze(0),
+                "muril_ids": enc_muril["input_ids"].squeeze(0),
+                "muril_mask": enc_muril["attention_mask"].squeeze(0),
+                "muril_tti": enc_muril["token_type_ids"].squeeze(0),
+                "label": torch.tensor(label, dtype=torch.long),
+                "language": language
+            }
         # Tokenise — padding and truncation to fixed length
         encoding = self.tokenizer(
             text,
@@ -111,7 +132,7 @@ class MultilingualFakeNewsDataset(Dataset):
             truncation=True,
             return_tensors="pt",
         )
-
+        
         # ── Build output dict ─────────────────────────────────────────────── #
         item = {
             "input_ids":      encoding["input_ids"].squeeze(0),       # [L]

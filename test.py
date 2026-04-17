@@ -162,10 +162,20 @@ class FakeNewsDetector:
         self.model.eval()
         print("Model ready for inference.")
 
-        # ── Tokenizer ─────────────────────────────────────────────────────── #
-        tokenizer_name = TOKENIZER_MAP.get(norm_type, "xlm-roberta-base")
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-        print(f"Tokenizer: {tokenizer_name}\n")
+        # ── Tokenizer(s) ─────────────────────────────────────────────────── #
+        if norm_type == "ensemble":
+            # Ensemble: load both tokenizers
+            self.tokenizer_xlmr = AutoTokenizer.from_pretrained("xlm-roberta-base", use_fast=True)
+            self.tokenizer_muril = AutoTokenizer.from_pretrained("google/muril-base-cased", use_fast=True)
+            self.tokenizer = None  # Not used
+            print(f"Tokenizers: XLM-RoBERTa + MuRIL\n")
+        else:
+            # Single tokenizer for standalone models
+            tokenizer_name = TOKENIZER_MAP.get(norm_type, "xlm-roberta-base")
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+            self.tokenizer_xlmr = None
+            self.tokenizer_muril = None
+            print(f"Tokenizer: {tokenizer_name}\n")
 
     def _build_ensemble(self, ckpt_path: str):
         """
@@ -186,6 +196,8 @@ class FakeNewsDetector:
     def predict(self, text: str, show_details: bool = True) -> dict:
         """
         Predict whether a news text is fake or real.
+        
+        Handles tokenization for all three model types (XLM-RoBERTa, MuRIL, Ensemble).
 
         Args:
             text:         Input text string.
@@ -204,26 +216,57 @@ class FakeNewsDetector:
         except Exception:
             language = "unknown"
 
-        # Tokenise
-        encoding = self.tokenizer(
-            text,
-            max_length=self.max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        input_ids      = encoding["input_ids"].to(self.device)
-        attention_mask = encoding["attention_mask"].to(self.device)
-        token_type_ids = encoding.get("token_type_ids")
-        if isinstance(token_type_ids, torch.Tensor):
-            token_type_ids = token_type_ids.to(self.device)
-
-        # Use model.predict() — guaranteed eval mode + no_grad
+        # Tokenise based on model type
         norm_type = _normalise_type(self.model_type)
-        if norm_type in ("muril", "ensemble"):
-            probs, prediction = self.model.predict(input_ids, attention_mask, token_type_ids)
+        
+        if norm_type == "ensemble":
+            # Ensemble: dual tokenization with both models
+            enc_xlmr = self.tokenizer_xlmr(
+                text,
+                max_length=self.max_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            enc_muril = self.tokenizer_muril(
+                text,
+                max_length=self.max_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            xlmr_ids = enc_xlmr["input_ids"].to(self.device)
+            xlmr_mask = enc_xlmr["attention_mask"].to(self.device)
+            muril_ids = enc_muril["input_ids"].to(self.device)
+            muril_mask = enc_muril["attention_mask"].to(self.device)
+            muril_tti = enc_muril.get("token_type_ids")
+            if isinstance(muril_tti, torch.Tensor):
+                muril_tti = muril_tti.to(self.device)
+            
+            # Call predict with 5 ensemble parameters
+            probs, prediction = self.model.predict(xlmr_ids, xlmr_mask, muril_ids, muril_mask, muril_tti)
+        
         else:
-            probs, prediction = self.model.predict(input_ids, attention_mask)
+            # Single tokenization for XLM-RoBERTa or MuRIL
+            encoding = self.tokenizer(
+                text,
+                max_length=self.max_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            input_ids = encoding["input_ids"].to(self.device)
+            attention_mask = encoding["attention_mask"].to(self.device)
+            token_type_ids = encoding.get("token_type_ids")
+            if isinstance(token_type_ids, torch.Tensor):
+                token_type_ids = token_type_ids.to(self.device)
+            
+            if norm_type == "muril":
+                # MuRIL: accept token_type_ids
+                probs, prediction = self.model.predict(input_ids, attention_mask, token_type_ids)
+            else:
+                # XLM-RoBERTa: no token_type_ids
+                probs, prediction = self.model.predict(input_ids, attention_mask)
 
         label     = "REAL" if prediction.item() == 1 else "FAKE"
         fake_prob = probs[0, 0].item()

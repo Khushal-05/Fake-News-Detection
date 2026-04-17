@@ -52,7 +52,7 @@ class EnsembleFakeNewsClassifier(nn.Module):
         num_classes: int = 2,
         ensemble_method: str = 'weighted_avg',
         weights: list[float] | None = None,
-        freeze_base_models: bool = False,
+        freeze_base_models: bool = True,
         use_gradient_checkpointing: bool = False,
     ):
         """
@@ -155,9 +155,11 @@ class EnsembleFakeNewsClassifier(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        token_type_ids: torch.Tensor | None = None,
+        xlmr_ids: torch.Tensor,
+        xlmr_mask: torch.Tensor,
+        muril_ids: torch.Tensor,
+        muril_mask: torch.Tensor,
+        muril_tti: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -178,10 +180,10 @@ class EnsembleFakeNewsClassifier(nn.Module):
         """
         # -- Sub-model forward passes -------------------------------------- #
         # XLM-RoBERTa: no token_type_ids
-        xlmr_logits  = self.xlmr_model(input_ids, attention_mask)
+        xlmr_logits  = self.xlmr_model(xlmr_ids, xlmr_mask)
 
         # MuRIL: token_type_ids optional
-        muril_logits = self.muril_model(input_ids, attention_mask, token_type_ids)
+        muril_logits = self.muril_model(muril_ids, muril_mask, muril_tti)
 
         # -- Ensemble ------------------------------------------------------ #
         if self.ensemble_method == 'weighted_avg':
@@ -217,7 +219,7 @@ class EnsembleFakeNewsClassifier(nn.Module):
             # Concatenate raw logits — the FC layer learns its own scaling
             combined = torch.cat([xlmr_logits, muril_logits], dim=-1)  # [B, 2C]
             logits   = self.ensemble_fc(combined)                       # [B, C]
-
+        
         return logits
 
     # ---------------------------------------------------------------------- #
@@ -227,12 +229,23 @@ class EnsembleFakeNewsClassifier(nn.Module):
     @torch.no_grad()
     def predict(
         self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        token_type_ids: torch.Tensor | None = None,
+        xlmr_ids: torch.Tensor,
+        xlmr_mask: torch.Tensor,
+        muril_ids: torch.Tensor,
+        muril_mask: torch.Tensor,
+        muril_tti: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Run inference with dropout disabled across all sub-models.
+        """Run inference with dropout disabled across all sub-models.
+        
+        This method must match the forward() signature for ensemble models.
+        It takes separate tokenizations for XLM-RoBERTa and MuRIL vocabularies.
+
+        Args:
+            xlmr_ids:    XLM-RoBERTa input token IDs [batch_size, seq_length]
+            xlmr_mask:   XLM-RoBERTa attention mask [batch_size, seq_length]
+            muril_ids:   MuRIL input token IDs [batch_size, seq_length]
+            muril_mask:  MuRIL attention mask [batch_size, seq_length]
+            muril_tti:   MuRIL token type IDs [batch_size, seq_length], optional
 
         Returns:
             probs: Softmax probabilities [batch_size, num_classes]
@@ -241,9 +254,10 @@ class EnsembleFakeNewsClassifier(nn.Module):
         was_training = self.training
         self.eval()
 
-        logits = self.forward(input_ids, attention_mask, token_type_ids)
+        # Forward pass with ensemble inputs (5 tensors)
+        logits = self.forward(xlmr_ids, xlmr_mask, muril_ids, muril_mask, muril_tti)
 
-        # FIX: output space differs by method:
+        # Convert logits to probabilities based on ensemble method:
         #   weighted_avg / max → log-probabilities: use exp() to get probs
         #   learned            → raw logits: use softmax to get probs
         if self.ensemble_method == 'learned':
@@ -251,7 +265,7 @@ class EnsembleFakeNewsClassifier(nn.Module):
         else:
             probs = torch.exp(logits)          # inverse of log()
 
-        preds  = torch.argmax(probs,  dim=-1)
+        preds = torch.argmax(probs, dim=-1)
 
         if was_training:
             self.train()

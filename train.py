@@ -22,6 +22,30 @@ Key fixes from original:
     - pin_memory only activated when CUDA is available (avoids CPU warning)
     - Best checkpoint tracked by val F1 (more robust than accuracy for
       imbalanced multilingual datasets)
+
+Resumption-dip fixes (v2):
+    FIX-1 — Scheduler curve mismatch (primary cause of the dip):
+        The resume checkpoint now stores total_steps and completed_steps.
+        On resume, the scheduler is rebuilt with the SAME total_steps as the
+        original run, not a fresh N-epoch total. This preserves the exact
+        shape of the LR decay curve so the LR at step K in session 2 is
+        identical to what it would have been in session 1.
+        Implementation: _peek_resume_epoch() reads epoch/total_steps from
+        the checkpoint BEFORE __init__ builds the optimizer, so
+        num_training_steps is always consistent across sessions.
+
+    FIX-2 — DataLoader shuffle seed:
+        A seeded torch.Generator is used for the train DataLoader so batch
+        ordering is deterministic and reproducible across sessions.
+        The seed advances by 1 each epoch (via _set_epoch_seed()) so
+        batches still differ between epochs as intended.
+
+    FIX-3 — start_epoch extracted before optimizer build:
+        _peek_resume_epoch() is a lightweight static helper that reads only
+        the epoch and total_steps fields from the checkpoint dict without
+        touching model weights. This value is used in __init__ to correctly
+        calculate num_training_steps for the scheduler before
+        _load_resume_checkpoint() runs the full state restoration.
 """
 
 import os
@@ -29,6 +53,8 @@ import time
 import json
 import shutil
 import csv
+import signal
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -99,6 +125,33 @@ def _safe_load(model: nn.Module, state_dict: dict) -> None:
         model.load_state_dict(state_dict, strict=False)
 
 
+# ── FIX-1 / FIX-3: lightweight peek helper ──────────────────────────────── #
+
+def _peek_resume_epoch(resume_checkpoint: dict | None) -> tuple[int, int | None]:
+    """
+    Read epoch and total_steps from a resume checkpoint WITHOUT loading any
+    tensors or model weights.  Called before __init__ builds the optimizer so
+    that num_training_steps can be set correctly.
+
+    Args:
+        resume_checkpoint: The raw checkpoint dict, or None for a fresh run.
+
+    Returns:
+        (start_epoch, total_steps)
+            start_epoch  — number of epochs already completed (0 if fresh).
+            total_steps  — the total_steps value stored when the checkpoint
+                           was saved, or None if the checkpoint pre-dates
+                           this fix (safe fallback: caller recomputes it).
+    """
+    if resume_checkpoint is None:
+        return 0, None
+    start_epoch = int(resume_checkpoint.get("epoch", 0))
+    total_steps = resume_checkpoint.get("total_steps", None)
+    if total_steps is not None:
+        total_steps = int(total_steps)
+    return start_epoch, total_steps
+
+
 # ════════════════════════════════════════════════════════════════════════════ #
 #  FakeNewsTrainer                                                             #
 # ════════════════════════════════════════════════════════════════════════════ #
@@ -115,6 +168,13 @@ class FakeNewsTrainer:
         - pin_memory only on CUDA
         - warmup_ratio instead of raw warmup_steps
         - Best checkpoint tracked by val F1
+
+    Resumption-dip fixes (v2):
+        - Scheduler rebuilt with the same total_steps as the original session
+          so the LR decay curve shape is preserved exactly across sessions.
+        - Train DataLoader uses a seeded Generator for reproducible shuffling.
+        - start_epoch is extracted from the checkpoint BEFORE the optimizer
+          is built so num_training_steps is always consistent.
     """
 
     def __init__(
@@ -133,6 +193,10 @@ class FakeNewsTrainer:
         max_grad_norm: float = 1.0,
         use_wandb: bool = False,
         config: dict = None,
+        resume_checkpoint: dict = None,
+        log_dir: str = "outputs/logs",
+        save_resume_every_n_epochs: int = 1,
+        dataloader_seed: int = 42,          # FIX-2: seed for reproducible shuffling
     ):
         self.model      = model.to(device)
         self.model_type = _normalise_model_type(model_type)
@@ -142,10 +206,18 @@ class FakeNewsTrainer:
         self.max_grad_norm = max_grad_norm
         self.use_wandb  = use_wandb
         self.config     = config or {}
+        self.dataloader_seed = dataloader_seed  # FIX-2
+
+        # Resumable training state
+        self.log_dir = log_dir
+        self.save_resume_every_n_epochs = save_resume_every_n_epochs
+        self.interrupted = False
+
+        # ── FIX-3: peek at start_epoch BEFORE building optimizer ─────────── #
+        # This must happen first so num_training_steps below is correct.
+        self.start_epoch, _stored_total_steps = _peek_resume_epoch(resume_checkpoint)
 
         # ── Loss function ────────────────────────────────────────────────── #
-        # Ensemble weighted_avg/max paths output log-probabilities → NLLLoss.
-        # All other paths output raw logits → CrossEntropyLoss.
         if (
             self.model_type == "ensemble"
             and isinstance(model, EnsembleFakeNewsClassifier)
@@ -158,12 +230,19 @@ class FakeNewsTrainer:
         # ── DataLoaders ──────────────────────────────────────────────────── #
         pin = (device == "cuda" and torch.cuda.is_available())
 
+        # FIX-2: seeded Generator so batch order is reproducible across sessions.
+        # The seed advances per epoch inside _set_epoch_seed(), so epochs still
+        # see different orderings from each other.
+        self._train_generator = torch.Generator()
+        self._train_generator.manual_seed(dataloader_seed)
+
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
             num_workers=4,
             pin_memory=pin,
+            generator=self._train_generator,
         )
         self.val_loader = DataLoader(
             val_dataset,
@@ -173,8 +252,29 @@ class FakeNewsTrainer:
             pin_memory=pin,
         )
 
-        # ── Optimizer + scheduler with differential LRs ──────────────────── #
-        num_training_steps = len(self.train_loader) * num_epochs
+        # ── FIX-1: compute num_training_steps consistently across sessions ─ #
+        #
+        # Fresh run:  total_steps = steps_per_epoch * num_epochs   (unchanged)
+        #
+        # Resumed run with stored total_steps (new checkpoints):
+        #   Reuse the EXACT same total_steps that the original session used.
+        #   This preserves the LR decay curve shape — at step K the LR is
+        #   the same value it would have been had training never been interrupted.
+        #
+        # Resumed run WITHOUT stored total_steps (old checkpoints, backward compat):
+        #   Fall back to recomputing from num_epochs so old checkpoints still work.
+        #   The dip may still occur for these old checkpoints, but new ones are safe.
+        #
+        steps_per_epoch = len(self.train_loader)
+        if _stored_total_steps is not None:
+            # New-format checkpoint: preserve the original curve exactly.
+            num_training_steps = _stored_total_steps
+        else:
+            # Fresh run OR old checkpoint without total_steps stored.
+            num_training_steps = steps_per_epoch * num_epochs
+
+        self._num_training_steps = num_training_steps   # stored for saving later
+
         opt_kwargs = dict(
             num_training_steps=num_training_steps,
             encoder_lr=encoder_lr,
@@ -200,36 +300,98 @@ class FakeNewsTrainer:
             "val_precision": [], "val_recall": [],
         }
 
+        # Setup persistent CSV logging
+        os.makedirs(log_dir, exist_ok=True)
+        self.metrics_log_path = os.path.join(log_dir, f"{self.model_type}_metrics.csv")
+        if not os.path.exists(self.metrics_log_path):
+            with open(self.metrics_log_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=[
+                    'timestamp', 'epoch', 'train_loss', 'train_accuracy', 'train_f1',
+                    'val_loss', 'val_accuracy', 'val_precision', 'val_recall', 'val_f1',
+                    'best_val_f1', 'per_lang_acc_json'
+                ])
+                writer.writeheader()
+
+        # Resume from checkpoint if provided.
+        # Optimizer and scheduler are already built above with the correct
+        # total_steps; _load_resume_checkpoint() restores their saved states
+        # (momentum buffers, last_epoch counter, etc.) on top of that.
+        if resume_checkpoint is not None:
+            self._load_resume_checkpoint(resume_checkpoint)
+
+        # Setup graceful interrupt handler
+        signal.signal(signal.SIGINT, self._interrupt_handler)
+        signal.signal(signal.SIGTERM, self._interrupt_handler)
+
+    # ── FIX-2: per-epoch seed helper ─────────────────────────────────────── #
+
+    def _set_epoch_seed(self, epoch: int) -> None:
+        """
+        Advance the DataLoader Generator seed to a deterministic value for
+        this epoch.  Ensures:
+            - Same session vs. resumed session → identical batch order.
+            - Different epochs → different batch orderings (seed varies by epoch).
+
+        Called at the top of each epoch iteration in train().
+        """
+        self._train_generator.manual_seed(self.dataloader_seed + epoch)
+
     # ── Batch routing helpers ─────────────────────────────────────────────── #
 
-    def _unpack_batch(self, batch: dict):
+    def _unpack_batch(self, batch: dict) -> tuple:
+        """Unpack batch into model-specific inputs and labels.
+
+        Returns:
+            (inputs, labels) where inputs is a tuple of tensors specific to
+            the model type.
         """
-        Extract tensors from a dataloader batch.
-        token_type_ids is forwarded only for MuRIL and ensemble
-        (XLM-RoBERTa does not use segment embeddings).
+        labels = batch["label"].to(self.device)
+
+        if self.model_type == "ensemble":
+            xlmr_ids  = batch["xlmr_ids"].to(self.device)
+            xlmr_mask = batch["xlmr_mask"].to(self.device)
+            muril_ids = batch["muril_ids"].to(self.device)
+            muril_mask = batch["muril_mask"].to(self.device)
+            muril_tti = batch.get("muril_tti")
+            if muril_tti is not None:
+                muril_tti = muril_tti.to(self.device)
+            return (xlmr_ids, xlmr_mask, muril_ids, muril_mask, muril_tti), labels
+        else:
+            input_ids      = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            token_type_ids = batch.get("token_type_ids")
+            if token_type_ids is not None:
+                token_type_ids = token_type_ids.to(self.device)
+            return (input_ids, attention_mask, token_type_ids), labels
+
+    def _forward(self, inputs: tuple, model_type: str) -> torch.Tensor:
+        """Route inputs to the appropriate model forward pass.
+
+        Args:
+            inputs:     Tuple of tensors specific to model_type.
+            model_type: One of 'xlm-roberta', 'muril', 'ensemble'.
+
+        Returns:
+            logits: Model output logits [batch_size, num_classes].
         """
-        input_ids      = batch["input_ids"].to(self.device)
-        attention_mask = batch["attention_mask"].to(self.device)
-        labels         = batch["label"].to(self.device)
-
-        token_type_ids = None
-        if self.model_type in ("muril", "ensemble"):
-            raw_tti = batch.get("token_type_ids")
-            if isinstance(raw_tti, torch.Tensor):
-                token_type_ids = raw_tti.to(self.device)
-
-        return input_ids, attention_mask, token_type_ids, labels
-
-    def _forward(self, input_ids, attention_mask, token_type_ids):
-        """Route inputs to model respecting each model's forward() signature."""
-        if self.model_type == "xlm-roberta":
+        if model_type == "ensemble":
+            xlmr_ids, xlmr_mask, muril_ids, muril_mask, muril_tti = inputs
+            return self.model(xlmr_ids, xlmr_mask, muril_ids, muril_mask, muril_tti)
+        elif model_type == "xlm-roberta":
+            input_ids, attention_mask, _ = inputs
             return self.model(input_ids, attention_mask)
-        return self.model(input_ids, attention_mask, token_type_ids)
+        else:  # muril
+            input_ids, attention_mask, token_type_ids = inputs
+            return self.model(input_ids, attention_mask, token_type_ids)
 
     # ── train_epoch ──────────────────────────────────────────────────────── #
 
     def train_epoch(self) -> dict:
-        """Run one full training epoch. Returns dict of train metrics."""
+        """Run one full training epoch.
+
+        Returns:
+            dict with keys: 'loss', 'accuracy', 'f1'
+        """
         self.model.train()
         total_loss      = 0.0
         all_predictions = []
@@ -237,10 +399,10 @@ class FakeNewsTrainer:
 
         pbar = tqdm(self.train_loader, desc="Training", leave=False)
         for batch in pbar:
-            ids, mask, tti, labels = self._unpack_batch(batch)
+            inputs, labels = self._unpack_batch(batch)
 
             self.optimizer.zero_grad()
-            logits = self._forward(ids, mask, tti)
+            logits = self._forward(inputs, self.model_type)
             loss   = self.criterion(logits, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -263,7 +425,12 @@ class FakeNewsTrainer:
     # ── validate ─────────────────────────────────────────────────────────── #
 
     def validate(self) -> dict:
-        """Evaluate on validation set. Returns dict of val metrics."""
+        """Evaluate on validation set.
+
+        Returns:
+            dict with keys: 'loss', 'accuracy', 'precision', 'recall', 'f1',
+                            'per_language_accuracy'
+        """
         self.model.eval()
         total_loss      = 0.0
         all_predictions = []
@@ -272,9 +439,8 @@ class FakeNewsTrainer:
 
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc="Validation", leave=False):
-                ids, mask, tti, labels = self._unpack_batch(batch)
-
-                logits = self._forward(ids, mask, tti)
+                inputs, labels = self._unpack_batch(batch)
+                logits = self._forward(inputs, self.model_type)
                 loss   = self.criterion(logits, labels)
 
                 total_loss += loss.item()
@@ -316,6 +482,100 @@ class FakeNewsTrainer:
             "per_language_accuracy": per_lang_acc,
         }
 
+    # ── Resumable training helpers ────────────────────────────────────────── #
+
+    def _interrupt_handler(self, signum, frame):
+        """Handle Ctrl+C / system termination gracefully."""
+        print("\n" + "=" * 70)
+        print("INTERRUPT SIGNAL RECEIVED")
+        print("=" * 70)
+        print("Saving resume checkpoint before exit...")
+        self.interrupted = True
+
+    def _load_resume_checkpoint(self, checkpoint: dict) -> None:
+        """
+        Restore full training state from a resume checkpoint.
+
+        The optimizer and scheduler were already built with the correct
+        total_steps (via _peek_resume_epoch + FIX-1).  This method only
+        restores the saved parameter states (momentum buffers, last_epoch
+        counter, best metrics, history) on top of the already-correct curve.
+        """
+        print(f"\n  Loading resume state...")
+        # start_epoch and total_steps already set in __init__ via _peek_resume_epoch
+        self.best_val_f1 = checkpoint.get('best_val_f1', 0.0)
+        self.best_epoch  = checkpoint.get('best_epoch', 0)
+        if 'history' in checkpoint:
+            self.history = checkpoint['history']
+
+        if 'optimizer_state_dict' in checkpoint:
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print("  ✓ Optimizer state restored")
+            except Exception as e:
+                print(f"  ⚠ Could not restore optimizer: {e}")
+
+        if 'scheduler_state_dict' in checkpoint:
+            try:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                print("  ✓ Scheduler state restored")
+            except Exception as e:
+                print(f"  ⚠ Could not restore scheduler: {e}")
+
+        # FIX-2: restore the DataLoader Generator to the correct per-epoch seed
+        # so batch ordering in the resumed session matches what it would have been.
+        self._set_epoch_seed(self.start_epoch)
+        print("  ✓ DataLoader seed aligned to resumed epoch")
+
+        print(f"  Resuming from epoch {self.start_epoch + 1}")
+        print(f"  Best val F1 so far: {self.best_val_f1:.4f} (epoch {self.best_epoch})")
+
+    def _log_metrics_to_csv(self, epoch: int, train_m: dict, val_m: dict) -> None:
+        """Append per-epoch metrics to the persistent CSV log."""
+        row = {
+            'timestamp':        datetime.now().isoformat(),
+            'epoch':            epoch,
+            'train_loss':       train_m['loss'],
+            'train_accuracy':   train_m['accuracy'],
+            'train_f1':         train_m['f1'],
+            'val_loss':         val_m['loss'],
+            'val_accuracy':     val_m['accuracy'],
+            'val_precision':    val_m['precision'],
+            'val_recall':       val_m['recall'],
+            'val_f1':           val_m['f1'],
+            'best_val_f1':      self.best_val_f1,
+            'per_lang_acc_json': json.dumps(val_m.get('per_language_accuracy', {})),
+        }
+        with open(self.metrics_log_path, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=row.keys())
+            writer.writerow(row)
+
+    def _save_resume_checkpoint(self, save_dir: str, epoch: int, val_metrics: dict) -> None:
+        """
+        Save full training state so the next session can resume seamlessly.
+
+        FIX-1: total_steps is stored alongside epoch so the next session can
+        rebuild the scheduler with the same curve shape without recomputing it
+        from num_epochs (which might differ if the user changes the config).
+        """
+        resume_path = os.path.join(save_dir, f"{self.model_type}_resume.pt")
+        torch.save({
+            "model_state_dict":      self.model.state_dict(),
+            "optimizer_state_dict":  self.optimizer.state_dict(),
+            "scheduler_state_dict":  self.scheduler.state_dict(),
+            "epoch":                 epoch,
+            "total_steps":           self._num_training_steps,  # FIX-1: preserve curve
+            "best_val_f1":           self.best_val_f1,
+            "best_epoch":            self.best_epoch,
+            "history":               self.history,
+            "val_metrics":           val_metrics,
+            "model_type":            self.model_type,
+            "config":                self.config,
+            "dataloader_seed":       self.dataloader_seed,  # FIX-2: preserve seed
+            "timestamp":             datetime.now().isoformat(),
+        }, resume_path)
+        print(f"  Resume checkpoint saved → {resume_path}")
+
     # ── save_model ───────────────────────────────────────────────────────── #
 
     def save_model(self, save_path: str, epoch: int = 0, val_metrics: dict = None) -> None:
@@ -327,6 +587,7 @@ class FakeNewsTrainer:
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "scheduler_state_dict": self.scheduler.state_dict(),
                 "epoch":                epoch,
+                "total_steps":          self._num_training_steps,  # FIX-1
                 "best_val_f1":          self.best_val_f1,
                 "val_metrics":          val_metrics or {},
                 "model_type":           self.model_type,
@@ -340,75 +601,111 @@ class FakeNewsTrainer:
 
     def train(self, save_dir: str = "models/checkpoints") -> nn.Module:
         """
-        Full training loop. Saves the best checkpoint (by val F1).
-        Reloads best weights into the model before returning.
+        Full training loop with resumable checkpoints and persistent logging.
+
+        - Starts from self.start_epoch (0 if fresh, >0 if resumed).
+        - FIX-2: advances the DataLoader seed at the start of each epoch so
+          batch ordering is deterministic and consistent across sessions.
+        - Saves resume checkpoint every N epochs.
+        - Logs metrics to CSV after each epoch.
+        - Handles interrupts gracefully (saves state before exit).
         """
         print(f"\nStarting training — {self.num_epochs} epoch(s), model={self.model_type}")
+        if self.start_epoch > 0:
+            print(f"  (Resuming from epoch {self.start_epoch + 1})")
+        print(f"  Scheduler total_steps={self._num_training_steps} "
+              f"(steps_per_epoch={len(self.train_loader)})")
+
         best_path = os.path.join(save_dir, f"{self.model_type}_best.pt")
 
-        for epoch in range(self.num_epochs):
-            print(f"\n{'='*55}")
-            print(f"Epoch {epoch + 1} / {self.num_epochs}")
-            print(f"{'='*55}")
+        try:
+            for epoch in range(self.start_epoch, self.num_epochs):
+                if self.interrupted:
+                    print("\nInterrupted. Saving state...")
+                    self._save_resume_checkpoint(save_dir, epoch, {})
+                    print("Resume checkpoint saved. Exiting gracefully.")
+                    break
 
-            train_m = self.train_epoch()
-            val_m   = self.validate()
+                # FIX-2: set deterministic seed for this epoch's shuffle
+                self._set_epoch_seed(epoch)
 
-            # Record history
-            self.history["train_loss"].append(train_m["loss"])
-            self.history["train_accuracy"].append(train_m["accuracy"])
-            self.history["train_f1"].append(train_m["f1"])
-            self.history["val_loss"].append(val_m["loss"])
-            self.history["val_accuracy"].append(val_m["accuracy"])
-            self.history["val_precision"].append(val_m["precision"])
-            self.history["val_recall"].append(val_m["recall"])
-            self.history["val_f1"].append(val_m["f1"])
+                print(f"\n{'=' * 55}")
+                print(f"Epoch {epoch + 1} / {self.num_epochs}")
+                print(f"{'=' * 55}")
 
-            print(
-                f"\n  Train  loss={train_m['loss']:.4f}  "
-                f"acc={train_m['accuracy']:.4f}  f1={train_m['f1']:.4f}"
-            )
-            print(
-                f"  Val    loss={val_m['loss']:.4f}  "
-                f"acc={val_m['accuracy']:.4f}  f1={val_m['f1']:.4f}  "
-                f"prec={val_m['precision']:.4f}  rec={val_m['recall']:.4f}"
-            )
+                train_m = self.train_epoch()
+                val_m   = self.validate()
 
-            if val_m["per_language_accuracy"]:
-                print("  Per-language val accuracy:")
-                for lang, acc in sorted(
-                    val_m["per_language_accuracy"].items(),
-                    key=lambda x: x[1], reverse=True,
-                ):
-                    print(f"    {lang:>8}: {acc:.4f}")
+                # Record history
+                self.history["train_loss"].append(train_m["loss"])
+                self.history["train_accuracy"].append(train_m["accuracy"])
+                self.history["train_f1"].append(train_m["f1"])
+                self.history["val_loss"].append(val_m["loss"])
+                self.history["val_accuracy"].append(val_m["accuracy"])
+                self.history["val_precision"].append(val_m["precision"])
+                self.history["val_recall"].append(val_m["recall"])
+                self.history["val_f1"].append(val_m["f1"])
 
-            if self.use_wandb:
-                try:
-                    import wandb
-                    wandb.log({
-                        "epoch":          epoch + 1,
-                        "train/loss":     train_m["loss"],
-                        "train/accuracy": train_m["accuracy"],
-                        "train/f1":       train_m["f1"],
-                        "val/loss":       val_m["loss"],
-                        "val/accuracy":   val_m["accuracy"],
-                        "val/precision":  val_m["precision"],
-                        "val/recall":     val_m["recall"],
-                        "val/f1":         val_m["f1"],
-                    })
-                except Exception as e:
-                    print(f"  [wandb] logging failed: {e}")
+                self._log_metrics_to_csv(epoch + 1, train_m, val_m)
 
-            if val_m["f1"] > self.best_val_f1:
-                self.best_val_f1 = val_m["f1"]
-                self.best_epoch  = epoch + 1
-                self.save_model(best_path, epoch=epoch + 1, val_metrics=val_m)
-                print(f"  ★ New best val F1={self.best_val_f1:.4f} (epoch {self.best_epoch})")
+                print(
+                    f"\n  Train  loss={train_m['loss']:.4f}  "
+                    f"acc={train_m['accuracy']:.4f}  f1={train_m['f1']:.4f}"
+                )
+                print(
+                    f"  Val    loss={val_m['loss']:.4f}  "
+                    f"acc={val_m['accuracy']:.4f}  f1={val_m['f1']:.4f}  "
+                    f"prec={val_m['precision']:.4f}  rec={val_m['recall']:.4f}"
+                )
 
-        print(f"\n{'='*55}")
+                if val_m["per_language_accuracy"]:
+                    print("  Per-language val accuracy:")
+                    for lang, acc in sorted(
+                        val_m["per_language_accuracy"].items(),
+                        key=lambda x: x[1], reverse=True,
+                    ):
+                        print(f"    {lang:>8}: {acc:.4f}")
+
+                if self.use_wandb:
+                    try:
+                        import wandb
+                        wandb.log({
+                            "epoch":          epoch + 1,
+                            "train/loss":     train_m["loss"],
+                            "train/accuracy": train_m["accuracy"],
+                            "train/f1":       train_m["f1"],
+                            "val/loss":       val_m["loss"],
+                            "val/accuracy":   val_m["accuracy"],
+                            "val/precision":  val_m["precision"],
+                            "val/recall":     val_m["recall"],
+                            "val/f1":         val_m["f1"],
+                        })
+                    except Exception as e:
+                        print(f"  [wandb] logging failed: {e}")
+
+                # Save best checkpoint
+                if val_m["f1"] > self.best_val_f1:
+                    self.best_val_f1 = val_m["f1"]
+                    self.best_epoch  = epoch + 1
+                    self.save_model(best_path, epoch=epoch + 1, val_metrics=val_m)
+                    print(f"  ★ New best val F1={self.best_val_f1:.4f} (epoch {self.best_epoch})")
+
+                # Save resume checkpoint periodically
+                if (epoch + 1) % self.save_resume_every_n_epochs == 0:
+                    self._save_resume_checkpoint(save_dir, epoch + 1, val_m)
+
+        except KeyboardInterrupt:
+            print("\n\nKeyboardInterrupt caught. Saving state...")
+            current_epoch = epoch if 'epoch' in locals() else self.start_epoch
+            self._save_resume_checkpoint(save_dir, current_epoch, {})
+            print("Resume checkpoint saved. You can restart training to continue.")
+            raise
+
+        print(f"\n{'=' * 55}")
         print(f"Training complete.")
         print(f"Best val F1 = {self.best_val_f1:.4f} at epoch {self.best_epoch}")
         print(f"Best checkpoint: {best_path}")
+        print(f"Metrics log: {self.metrics_log_path}")
 
         # Reload best weights before returning
         ckpt = torch.load(best_path, map_location=self.device)
@@ -437,7 +734,7 @@ CONFIG = {
     "warmup_ratio":     0.1,
     "max_length":       512,
     "dropout":          0.3,
-    "freeze_layers":    0,
+    "freeze_layers":    6,
     "use_wandb":        False,
     "device":           "cuda" if torch.cuda.is_available() else "cpu",
     "save_dir":         "models/checkpoints",
@@ -457,8 +754,7 @@ if __name__ == "__main__":
     TOKENIZER_MAP = {
         "xlm-roberta": "xlm-roberta-base",
         "muril":       "google/muril-base-cased",
-        # Ensemble: tokenise with the primary model (MuRIL favoured for Indian data)
-        "ensemble":    "google/muril-base-cased",
+        "ensemble":    "ensemble",
     }
     tokenizer_name = TOKENIZER_MAP[model_type]
 
@@ -466,10 +762,6 @@ if __name__ == "__main__":
     print("Loading data...")
     train_df = pd.read_csv("data/processed/train.csv")
     val_df   = pd.read_csv("data/processed/val.csv")
-
-    print("Train_Length: ",len(train_df))
-    print("Val_Length: ",len(val_df))
-    print("Train_Shape: ",train_df.shape)
 
     train_dataset = MultilingualFakeNewsDataset(
         texts=train_df["cleaned_text"].values,
@@ -515,7 +807,6 @@ if __name__ == "__main__":
             model_name=CONFIG.get("model_name", "google/muril-base-cased"),
             **common_kwargs,
         )
-        # Load optional pre-fine-tuned sub-model weights
         for sub_model, ckpt_key, label in [
             (xlmr,  "xlmr_checkpoint",  "XLM-R"),
             (muril, "muril_checkpoint", "MuRIL"),
@@ -533,13 +824,18 @@ if __name__ == "__main__":
             num_classes=2,
             ensemble_method=CONFIG.get("ensemble_method", "weighted_avg"),
             weights=CONFIG.get("ensemble_weights"),
-            freeze_base_models=False,
+            freeze_base_models=True,
         )
 
     param_info = model.count_parameters()
+    # count_parameters() key names differ by model type:
+    #   EnsembleFakeNewsClassifier  → 'total_trainable', 'total_frozen'
+    #   XLM-R / MuRIL               → 'trainable', 'frozen'
+    t_key = "total_trainable" if "total_trainable" in param_info else "trainable"
+    f_key = "total_frozen"    if "total_frozen"    in param_info else "frozen"
     print(
-        f"  Trainable: {param_info['trainable']:,} | "
-        f"Frozen: {param_info['frozen']:,} | "
+        f"  Trainable: {param_info[t_key]:,} | "
+        f"Frozen: {param_info[f_key]:,} | "
         f"Total: {param_info['total']:,}"
     )
 
@@ -596,21 +892,31 @@ if __name__ == "__main__":
 
     with torch.no_grad():
         for batch in trainer.val_loader:
-            ids      = batch["input_ids"].to(device)
-            mask     = batch["attention_mask"].to(device)
-            labels   = batch["label"]
-            tti      = None
-            if model_type in ("muril", "ensemble"):
-                raw_tti = batch.get("token_type_ids")
-                if isinstance(raw_tti, torch.Tensor):
-                    tti = raw_tti.to(device)
+            labels = batch["label"]
 
-            if model_type == "xlm-roberta":
-                logits = trained_model(ids, mask)
-            else:
-                logits = trained_model(ids, mask, tti)
+            if model_type == "ensemble":
+                logits = trained_model(
+                    batch["xlmr_ids"].to(device),
+                    batch["xlmr_mask"].to(device),
+                    batch["muril_ids"].to(device),
+                    batch["muril_mask"].to(device),
+                    batch["muril_tti"].to(device),
+                )
+            elif model_type == "xlm-roberta":
+                logits = trained_model(
+                    batch["input_ids"].to(device),
+                    batch["attention_mask"].to(device),
+                )
+            else:  # muril
+                tti = batch.get("token_type_ids")
+                if isinstance(tti, torch.Tensor):
+                    tti = tti.to(device)
+                logits = trained_model(
+                    batch["input_ids"].to(device),
+                    batch["attention_mask"].to(device),
+                    tti,
+                )
 
-            # Convert to probabilities (handle log-prob output for ensemble)
             if (
                 model_type == "ensemble"
                 and isinstance(trained_model, EnsembleFakeNewsClassifier)
@@ -650,7 +956,6 @@ if __name__ == "__main__":
     )
     with open(os.path.join(run_dir, "predictions.csv"), "w", newline="", encoding="utf-8") as cf:
         writer = csv.writer(cf)
-        # Column name must be "y_proba" — visualisation.py reads r["y_proba"] from CSV
         writer.writerow(["y_true", "y_pred", "y_proba", "language"])
         for row in zip(
             y_true_arr.tolist(), y_pred_arr.tolist(),

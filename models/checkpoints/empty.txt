@@ -1,0 +1,22 @@
+changes made for ensemble model training:-
+    1. Inference Block in train.py
+    2. param_info in train.py L716 (must be changed for standalone models before training)
+    3. Tokenizer map in evaluate.py for ensemble
+    4. Set freeze_base_models=True in train.py for ensemble L712
+    5. NoteBook changes -> param_info cell 7, freeze_base_model= True cell 7
+
+     # # changes:
+        # Replace this:
+        # print(f"  Trainable: {param_info['total_trainable']:,}")
+        # print(f"  Frozen:    {param_info['total_frozen']:,}")
+        # With this:
+        # print(f"  Trainable: {param_info['trainable']:,}")
+        # print(f"  Frozen:    {param_info['frozen']:,}")
+        # print(f"  Total:     {param_info['total']:,}")
+        # In your ensemble model, keys are:
+        # total_trainable
+        # total_frozen
+        # But in XLM-R / MuRIL models, keys are:
+        # trainable
+        # frozen
+        # total 

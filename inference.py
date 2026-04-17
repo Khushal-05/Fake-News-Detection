@@ -117,44 +117,95 @@ class FakeNewsDetector:
     ):
         self.model      = model.to(device)
         self.model.eval()
-        self.tokenizer  = AutoTokenizer.from_pretrained(tokenizer_name)
-        self.model_type = model_type.strip().lower()
+        self.model_type = model_type.strip().lower().replace("-", "").replace("_", "")
         self.device     = device
         self.max_length = max_length
+        
+        # For ensemble: load both tokenizers (XLM-RoBERTa + MuRIL)
+        if self.model_type == "ensemble":
+            self.tokenizer_xlmr = AutoTokenizer.from_pretrained("xlm-roberta-base", use_fast=True)
+            self.tokenizer_muril = AutoTokenizer.from_pretrained("google/muril-base-cased", use_fast=True)
+            self.tokenizer = None  # Not used for ensemble
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+            self.tokenizer_xlmr = None
+            self.tokenizer_muril = None
 
     def _tokenise(self, texts: list[str]) -> dict:
-        """Tokenise a list of texts into tensors on the correct device."""
-        enc = self.tokenizer(
-            texts,
-            max_length=self.max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        return {k: v.to(self.device) for k, v in enc.items()}
+        """Tokenise a list of texts into tensors on the correct device.
+        
+        For ensemble: returns dual tokenization (xlmr + muril).
+        For standalone: returns single tokenization.
+        """
+        if self.model_type == "ensemble":
+            # Tokenize with both models' tokenizers
+            enc_xlmr = self.tokenizer_xlmr(
+                texts,
+                max_length=self.max_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            enc_muril = self.tokenizer_muril(
+                texts,
+                max_length=self.max_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            # Combine into single dict with prefixed keys
+            result = {}
+            for k, v in enc_xlmr.items():
+                result[f"xlmr_{k}"] = v.to(self.device)
+            for k, v in enc_muril.items():
+                result[f"muril_{k}"] = v.to(self.device)
+            return result
+        else:
+            # Single tokenization for standalone models
+            enc = self.tokenizer(
+                texts,
+                max_length=self.max_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            return {k: v.to(self.device) for k, v in enc.items()}
 
     def _get_probs(self, enc: dict) -> torch.Tensor:
-        """
-        Run forward pass and return probability tensor [batch, num_classes].
-        Routes token_type_ids for MuRIL/ensemble; omits for XLM-RoBERTa.
-        Handles log-prob output from ensemble weighted_avg/max paths.
+        """Run forward pass and return probability tensor [batch, num_classes].
+        
+        Handles three cases:
+        - XLM-RoBERTa: input_ids + attention_mask only
+        - MuRIL: input_ids + attention_mask + optional token_type_ids
+        - Ensemble: dual tokenization (xlmr_ids/mask + muril_ids/mask/tti)
+        
+        Ensemble weighted_avg/max paths output log-probabilities → use exp().
         """
         from models.ensemble_model import EnsembleFakeNewsClassifier
 
-        input_ids      = enc["input_ids"]
-        attention_mask = enc["attention_mask"]
-        token_type_ids = enc.get("token_type_ids")
-
-        norm = self.model_type.replace("-", "").replace("_", "")
-
         with torch.no_grad():
-            if norm == "xlmroberta":
+            if self.model_type == "ensemble":
+                # Ensemble: extract dual tokenization keys
+                xlmr_ids  = enc["xlmr_input_ids"]
+                xlmr_mask = enc["xlmr_attention_mask"]
+                muril_ids = enc["muril_input_ids"]
+                muril_mask = enc["muril_attention_mask"]
+                muril_tti = enc.get("muril_token_type_ids")
+                
+                logits = self.model(xlmr_ids, xlmr_mask, muril_ids, muril_mask, muril_tti)
+            elif self.model_type == "xlmroberta":
+                # XLM-RoBERTa: no token_type_ids
+                input_ids = enc["input_ids"]
+                attention_mask = enc["attention_mask"]
                 logits = self.model(input_ids, attention_mask)
-            else:
-                # MuRIL and ensemble both accept optional token_type_ids
+            else:  # muril
+                # MuRIL: optional token_type_ids
+                input_ids = enc["input_ids"]
+                attention_mask = enc["attention_mask"]
+                token_type_ids = enc.get("token_type_ids")
                 logits = self.model(input_ids, attention_mask, token_type_ids)
 
-        # Ensemble weighted_avg/max outputs log-probabilities → use exp()
+        # Convert log-probs to probs if ensemble uses weighted_avg/max
         if (
             isinstance(self.model, EnsembleFakeNewsClassifier)
             and self.model.ensemble_method in ("weighted_avg", "max")
