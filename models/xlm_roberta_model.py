@@ -411,7 +411,7 @@ def train_one_epoch(
     for batch in dataloader:
         input_ids      = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        labels         = batch["labels"].to(device)
+        labels         = batch["label"].to(device)
 
         logits = model(input_ids, attention_mask)
         loss   = criterion(logits, labels)
@@ -457,7 +457,7 @@ def evaluate(
     for batch in dataloader:
         input_ids      = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        labels         = batch["labels"].to(device)
+        labels         = batch["label"].to(device)
 
         logits = model(input_ids, attention_mask)
         loss   = criterion(logits, labels)

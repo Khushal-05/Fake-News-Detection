@@ -21,6 +21,7 @@ Key fixes from original:
 """
 
 import os
+import sys
 import time
 
 import torch
@@ -39,37 +40,55 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 
-from data.dataset import MultilingualFakeNewsDataset
-from models.xlm_roberta_model import XLMRobertaFakeNewsClassifier
-from models.muril_model import MuRILFakeNewsClassifier
-from models.ensemble_model import EnsembleFakeNewsClassifier
+# ── Robust imports for both flat and package layouts ─────────────────────── #
+_THIS_DIR = os.path.abspath(os.path.dirname(__file__))
+_PARENT_DIR = os.path.abspath(os.path.join(_THIS_DIR, os.pardir))
+for _p in (_THIS_DIR, _PARENT_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+try:
+    from data.dataset import MultilingualFakeNewsDataset
+    from models.xlm_roberta_model import XLMRobertaFakeNewsClassifier
+    from models.muril_model import MuRILFakeNewsClassifier
+    from models.ensemble_model import EnsembleFakeNewsClassifier
+except ModuleNotFoundError:
+    from dataset import MultilingualFakeNewsDataset              # noqa: E402
+    from xlm_roberta_model import XLMRobertaFakeNewsClassifier  # noqa: E402
+    from muril_model import MuRILFakeNewsClassifier              # noqa: E402
+    from ensemble_model import EnsembleFakeNewsClassifier        # noqa: E402
 
 
-# ── Checkpoint helpers (shared with train.py) ────────────────────────────── #
-
-def _extract_state_dict(ckpt) -> dict:
-    if not isinstance(ckpt, dict):
+# ── Checkpoint helpers — shared via utils.checkpoint ────────────────────── #
+try:
+    from utils.checkpoint import extract_state_dict as _extract_state_dict
+    from utils.checkpoint import strip_module_prefix as _strip_module_prefix
+    from utils.checkpoint import safe_load as _safe_load
+except ImportError:
+    # Flat layout fallback (utils/ not on path yet — define inline)
+    def _extract_state_dict(ckpt) -> dict:
+        if not isinstance(ckpt, dict):
+            return ckpt
+        for key in ("model_state_dict", "state_dict", "model"):
+            if key in ckpt and isinstance(ckpt[key], dict):
+                return ckpt[key]
         return ckpt
-    for key in ("model_state_dict", "state_dict", "model"):
-        if key in ckpt and isinstance(ckpt[key], dict):
-            return ckpt[key]
-    return ckpt
 
+    def _strip_module_prefix(state_dict: dict) -> dict:
+        if any(k.startswith("module.") for k in state_dict):
+            return {k[len("module."):]: v for k, v in state_dict.items()}
+        return state_dict
 
-def _strip_module_prefix(state_dict: dict) -> dict:
-    if any(k.startswith("module.") for k in state_dict):
-        return {k[len("module."):]: v for k, v in state_dict.items()}
-    return state_dict
-
-
-def _safe_load(model, state_dict: dict) -> None:
-    state_dict = _strip_module_prefix(state_dict)
-    try:
-        model.load_state_dict(state_dict)
-        print("  Weights loaded (strict=True).")
-    except RuntimeError as e:
-        print(f"  Strict load failed ({e}). Retrying with strict=False.")
-        model.load_state_dict(state_dict, strict=False)
+    def _safe_load(model, state_dict: dict, verbose: bool = True) -> None:
+        state_dict = _strip_module_prefix(state_dict)
+        try:
+            model.load_state_dict(state_dict)
+            if verbose:
+                print("  Weights loaded (strict=True).")
+        except RuntimeError as e:
+            if verbose:
+                print(f"  Strict load failed ({e}). Retrying with strict=False.")
+            model.load_state_dict(state_dict, strict=False)
 
 
 def _normalise_model_type(raw: str) -> str:
@@ -123,41 +142,45 @@ class FakeNewsEvaluator:
 
     def _forward(self, batch: dict) -> torch.Tensor:
         """Run a single forward pass, routing inputs correctly per model type.
-        
+
+        FIX (BUG-7): removed inner `with torch.no_grad():` — this method is
+        always called from within `evaluate()` which already holds the outer
+        torch.no_grad() context. The redundant inner context was harmless but
+        misleading and added unnecessary overhead.
+
         Handles three batch formats:
         - XLM-RoBERTa: input_ids + attention_mask
         - MuRIL: input_ids + attention_mask + token_type_ids (optional)
         - Ensemble: xlmr_ids/mask + muril_ids/mask + muril_tti (from dataset dual tokenization)
-        
+
         Returns probability tensor [batch, num_classes].
         """
-        with torch.no_grad():
-            if self.model_type == "ensemble":
-                # Ensemble: extract keys from dual tokenization batch format
-                xlmr_ids = batch["xlmr_ids"].to(self.device)
-                xlmr_mask = batch["xlmr_mask"].to(self.device)
-                muril_ids = batch["muril_ids"].to(self.device)
-                muril_mask = batch["muril_mask"].to(self.device)
-                muril_tti = batch.get("muril_tti")
-                if muril_tti is not None:
-                    muril_tti = muril_tti.to(self.device)
-                
-                logits = self.model(xlmr_ids, xlmr_mask, muril_ids, muril_mask, muril_tti)
-            
-            elif self.model_type == "xlm-roberta":
-                # XLM-RoBERTa: no token_type_ids
-                input_ids = batch["input_ids"].to(self.device)
-                attention_mask = batch["attention_mask"].to(self.device)
-                logits = self.model(input_ids, attention_mask)
-            
-            else:  # muril
-                # MuRIL: optional token_type_ids
-                input_ids = batch["input_ids"].to(self.device)
-                attention_mask = batch["attention_mask"].to(self.device)
-                token_type_ids = batch.get("token_type_ids")
-                if token_type_ids is not None:
-                    token_type_ids = token_type_ids.to(self.device)
-                logits = self.model(input_ids, attention_mask, token_type_ids)
+        if self.model_type == "ensemble":
+            # Ensemble: extract keys from dual tokenization batch format
+            xlmr_ids = batch["xlmr_ids"].to(self.device)
+            xlmr_mask = batch["xlmr_mask"].to(self.device)
+            muril_ids = batch["muril_ids"].to(self.device)
+            muril_mask = batch["muril_mask"].to(self.device)
+            muril_tti = batch.get("muril_tti")
+            if muril_tti is not None:
+                muril_tti = muril_tti.to(self.device)
+
+            logits = self.model(xlmr_ids, xlmr_mask, muril_ids, muril_mask, muril_tti)
+
+        elif self.model_type == "xlm-roberta":
+            # XLM-RoBERTa: no token_type_ids
+            input_ids = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            logits = self.model(input_ids, attention_mask)
+
+        else:  # muril
+            # MuRIL: optional token_type_ids
+            input_ids = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            token_type_ids = batch.get("token_type_ids")
+            if token_type_ids is not None:
+                token_type_ids = token_type_ids.to(self.device)
+            logits = self.model(input_ids, attention_mask, token_type_ids)
 
         # Convert log-probs to probs if ensemble uses weighted_avg/max
         if (
@@ -455,16 +478,37 @@ if __name__ == "__main__":
             if path and os.path.isfile(path):
                 _safe_load(sub, _extract_state_dict(torch.load(path, map_location=device)))
 
+        # Auto-detect ensemble_method from checkpoint so the correct architecture
+        # (with or without ensemble_fc) is built BEFORE loading weights.
+        # Priority: explicit CONFIG key → checkpoint top-level key → checkpoint config
+        # → infer from state_dict keys → default to weighted_avg.
+        ens_ckpt_path = CONFIG["model_checkpoint"]
+        ensemble_method = CONFIG.get("ensemble_method")
+        if ensemble_method is None and os.path.isfile(ens_ckpt_path):
+            _ens_ckpt = torch.load(ens_ckpt_path, map_location=device)
+            if isinstance(_ens_ckpt, dict):
+                ensemble_method = _ens_ckpt.get("ensemble_method")
+                if ensemble_method is None:
+                    _cfg = _ens_ckpt.get("config", {}) or {}
+                    ensemble_method = _cfg.get("ensemble_method")
+                if ensemble_method is None:
+                    _sd = _extract_state_dict(_ens_ckpt)
+                    if any(k.startswith("ensemble_fc") for k in _sd):
+                        ensemble_method = "learned"
+        if ensemble_method is None:
+            ensemble_method = "weighted_avg"
+        print(f"  Ensemble method: {ensemble_method}")
+
         model = EnsembleFakeNewsClassifier(
             xlmr_model=xlmr,
             muril_model=muril,
             num_classes=2,
-            ensemble_method=CONFIG.get("ensemble_method", "weighted_avg"),
+            ensemble_method=ensemble_method,
         )
         # Load ensemble-level checkpoint if present (overrides sub-model weights)
-        if os.path.isfile(CONFIG["model_checkpoint"]):
+        if os.path.isfile(ens_ckpt_path):
             _safe_load(model, _extract_state_dict(
-                torch.load(CONFIG["model_checkpoint"], map_location=device)
+                torch.load(ens_ckpt_path, map_location=device)
             ))
 
     model.to(device)

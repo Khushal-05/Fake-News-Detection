@@ -388,7 +388,7 @@ def train_one_epoch(
     for batch in dataloader:
         input_ids      = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        labels         = batch["labels"].to(device)
+        labels         = batch["label"].to(device)
         token_type_ids = batch.get("token_type_ids")
         if token_type_ids is not None:
             token_type_ids = token_type_ids.to(device)
@@ -441,7 +441,7 @@ def evaluate(
     for batch in dataloader:
         input_ids      = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        labels         = batch["labels"].to(device)
+        labels         = batch["label"].to(device)
         token_type_ids = batch.get("token_type_ids")
         if token_type_ids is not None:
             token_type_ids = token_type_ids.to(device)

@@ -27,11 +27,16 @@ import argparse
 from datetime import datetime
 
 # ── Ensure project root is on sys.path ───────────────────────────────────── #
-# This file lives in  fnd/utils/eval_and_vis.py
-# Project root is     fnd/
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
+# Supports two layouts:
+#   Flat layout  (all files at root):  fnd/eval_and_vis.py
+#   Package layout (utils subdir):     fnd/utils/eval_and_vis.py → root is fnd/
+# We add BOTH the file's own directory AND its parent so that either layout
+# resolves imports correctly without manual configuration.
+_THIS_DIR = os.path.abspath(os.path.dirname(__file__))
+_PARENT_DIR = os.path.abspath(os.path.join(_THIS_DIR, os.pardir))
+for _p in (_THIS_DIR, _PARENT_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import torch
 import torch.nn.functional as F
@@ -48,39 +53,52 @@ from sklearn.metrics import (
 )
 from tqdm import tqdm
 
-# ── Project imports ──────────────────────────────────────────────────────── #
-from data.dataset import MultilingualFakeNewsDataset
-from models.xlm_roberta_model import XLMRobertaFakeNewsClassifier
-from models.muril_model import MuRILFakeNewsClassifier
-from models.ensemble_model import EnsembleFakeNewsClassifier
-from utils.visualisation import ModelVisualizer
+# ── Project imports — try both flat and package layouts ─────────────────── #
+try:
+    from data.dataset import MultilingualFakeNewsDataset
+    from models.xlm_roberta_model import XLMRobertaFakeNewsClassifier
+    from models.muril_model import MuRILFakeNewsClassifier
+    from models.ensemble_model import EnsembleFakeNewsClassifier
+    from utils.visualisation import ModelVisualizer
+except ModuleNotFoundError:
+    # Flat layout: all modules live at the project root
+    from dataset import MultilingualFakeNewsDataset                    # noqa: E402
+    from xlm_roberta_model import XLMRobertaFakeNewsClassifier         # noqa: E402
+    from muril_model import MuRILFakeNewsClassifier                    # noqa: E402
+    from ensemble_model import EnsembleFakeNewsClassifier              # noqa: E402
+    from visualisation import ModelVisualizer                          # noqa: E402
 
 
-# ── Checkpoint helpers (same as train.py) ────────────────────────────────── #
-
-def _extract_state_dict(ckpt) -> dict:
-    if not isinstance(ckpt, dict):
+# ── Checkpoint helpers — shared via utils.checkpoint ────────────────────── #
+try:
+    from utils.checkpoint import extract_state_dict as _extract_state_dict
+    from utils.checkpoint import strip_module_prefix as _strip_module_prefix
+    from utils.checkpoint import safe_load as _safe_load
+except ImportError:
+    # Flat layout fallback (utils/ not on path yet — define inline)
+    def _extract_state_dict(ckpt) -> dict:
+        if not isinstance(ckpt, dict):
+            return ckpt
+        for key in ("model_state_dict", "state_dict", "model"):
+            if key in ckpt and isinstance(ckpt[key], dict):
+                return ckpt[key]
         return ckpt
-    for key in ("model_state_dict", "state_dict", "model"):
-        if key in ckpt and isinstance(ckpt[key], dict):
-            return ckpt[key]
-    return ckpt
 
+    def _strip_module_prefix(state_dict: dict) -> dict:
+        if any(k.startswith("module.") for k in state_dict):
+            return {k[len("module."):]: v for k, v in state_dict.items()}
+        return state_dict
 
-def _strip_module_prefix(state_dict: dict) -> dict:
-    if any(k.startswith("module.") for k in state_dict):
-        return {k[len("module."):]: v for k, v in state_dict.items()}
-    return state_dict
-
-
-def _safe_load(model, state_dict: dict) -> None:
-    state_dict = _strip_module_prefix(state_dict)
-    try:
-        model.load_state_dict(state_dict)
-        print("  Weights loaded (strict=True).")
-    except RuntimeError as e:
-        print(f"  Strict load failed ({e}). Retrying strict=False.")
-        model.load_state_dict(state_dict, strict=False)
+    def _safe_load(model, state_dict: dict, verbose: bool = True) -> None:
+        state_dict = _strip_module_prefix(state_dict)
+        try:
+            model.load_state_dict(state_dict)
+            if verbose:
+                print("  Weights loaded (strict=True).")
+        except RuntimeError as e:
+            if verbose:
+                print(f"  Strict load failed ({e}). Retrying with strict=False.")
+            model.load_state_dict(state_dict, strict=False)
 
 
 def _normalise_model_type(raw: str) -> str:
@@ -184,16 +202,34 @@ class ModelEvaluatorVisualizer:
             xlmr = XLMRobertaFakeNewsClassifier(num_classes=2)
             muril = MuRILFakeNewsClassifier(num_classes=2)
 
-            # Determine ensemble_method from checkpoint metadata
-            ensemble_method = "learned"
+            # Determine ensemble_method from checkpoint metadata.
+            # Priority order:
+            #   1. Explicit key "ensemble_method" stored at top level of ckpt
+            #   2. Nested under ckpt["config"]["ensemble_method"]
+            #   3. Infer from state_dict keys: presence of "ensemble_fc.*" → learned
+            #   4. Infer from state_dict keys: presence of "weights" buffer → weighted_avg
+            #   5. Default to "weighted_avg" (safest non-parametric fallback)
+            ensemble_method = None
             if isinstance(ckpt, dict):
-                cfg = ckpt.get("config", {})
-                ensemble_method = cfg.get("ensemble_method", "learned")
-                # Also try from model_type metadata
-                if "ensemble_method" not in cfg:
-                    # Check if ensemble_fc keys exist in state_dict
-                    if any("ensemble_fc" in k for k in state_dict):
-                        ensemble_method = "learned"
+                # 1. Top-level key (written by newer checkpoints)
+                if "ensemble_method" in ckpt:
+                    ensemble_method = ckpt["ensemble_method"]
+                # 2. Under config dict
+                if ensemble_method is None:
+                    cfg = ckpt.get("config", {}) or {}
+                    if "ensemble_method" in cfg:
+                        ensemble_method = cfg["ensemble_method"]
+            # 3 & 4. Infer from state_dict structure
+            if ensemble_method is None:
+                if any(k.startswith("ensemble_fc") for k in state_dict):
+                    ensemble_method = "learned"
+                elif any(k == "weights" for k in state_dict):
+                    ensemble_method = "weighted_avg"
+                else:
+                    # No ensemble_fc and no weights buffer → max or weighted_avg
+                    # (max method has no extra params/buffers — default to weighted_avg)
+                    ensemble_method = "weighted_avg"
+            print(f"  Ensemble method: {ensemble_method}")
 
             self.model = EnsembleFakeNewsClassifier(
                 xlmr_model=xlmr,
@@ -269,12 +305,17 @@ class ModelEvaluatorVisualizer:
     def _forward_batch(self, batch: dict) -> torch.Tensor:
         """Run model-type-aware forward pass. Returns logits."""
         if self.model_type == "ensemble":
+            # FIX: use .get() so the method is safe even if the tokenizer
+            # does not produce token_type_ids (e.g. a custom ensemble dataset).
+            muril_tti = batch.get("muril_tti")
+            if muril_tti is not None:
+                muril_tti = muril_tti.to(self.device)
             logits = self.model(
                 batch["xlmr_ids"].to(self.device),
                 batch["xlmr_mask"].to(self.device),
                 batch["muril_ids"].to(self.device),
                 batch["muril_mask"].to(self.device),
-                batch["muril_tti"].to(self.device),
+                muril_tti,
             )
         elif self.model_type == "xlm-roberta":
             logits = self.model(
@@ -754,11 +795,13 @@ class ModelEvaluatorVisualizer:
         for root in search_dirs:
             if not os.path.isdir(root):
                 continue
-            # Look for model-type-specific directories first
+            # Patterns ordered by specificity: model-type dirs first, then any dir.
+            # All patterns use '**' so recursive=True actually recurses.
             patterns = [
-                os.path.join(root, f"{self.model_type}_*", "predictions.npz"),
-                os.path.join(root, f"{self.model_type}_*", "predictions.csv"),
+                os.path.join(root, "**", f"{self.model_type}_*", "predictions.npz"),
+                os.path.join(root, "**", f"{self.model_type}_*", "predictions.csv"),
                 os.path.join(root, "**", "predictions.npz"),
+                os.path.join(root, "**", "predictions.csv"),
             ]
             for pat in patterns:
                 matches = sorted(glob.glob(pat, recursive=True), key=os.path.getmtime, reverse=True)
@@ -820,23 +863,32 @@ class ModelEvaluatorVisualizer:
                 print(f"  Found existing predictions: {found}")
                 print()
 
-            choice = input("  Run evaluation? [y/N]: ").strip().lower()
-            print("-" * 70)
-
-            if choice in ("y", "yes"):
+            # Non-interactive guard: if stdin is not a tty (e.g. Kaggle, Colab,
+            # automated pipelines), skip the prompt and run evaluation by default.
+            import sys as _sys
+            _interactive = _sys.stdin.isatty() if hasattr(_sys.stdin, "isatty") else False
+            if not _interactive:
+                print("  Non-interactive environment detected — running evaluation.")
+                print("-" * 70)
                 run_inference = True
             else:
-                run_inference = False
-                if found:
-                    predictions_path = found
+                choice = input("  Run evaluation? [y/N]: ").strip().lower()
+                print("-" * 70)
+
+                if choice in ("y", "yes"):
+                    run_inference = True
                 else:
-                    # Ask for path
-                    custom = input("  Enter path to predictions file (.npz or .csv): ").strip()
-                    if custom and os.path.isfile(custom):
-                        predictions_path = custom
+                    run_inference = False
+                    if found:
+                        predictions_path = found
                     else:
-                        print("  No valid predictions file. Running evaluation instead.")
-                        run_inference = True
+                        # Ask for path
+                        custom = input("  Enter path to predictions file (.npz or .csv): ").strip()
+                        if custom and os.path.isfile(custom):
+                            predictions_path = custom
+                        else:
+                            print("  No valid predictions file. Running evaluation instead.")
+                            run_inference = True
 
         # ── Execute chosen path ──────────────────────────────────────────── #
         if run_inference:

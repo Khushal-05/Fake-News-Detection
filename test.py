@@ -27,9 +27,21 @@ import argparse
 import torch
 from transformers import AutoTokenizer
 
-from models.xlm_roberta_model import XLMRobertaFakeNewsClassifier
-from models.muril_model import MuRILFakeNewsClassifier
-from models.ensemble_model import EnsembleFakeNewsClassifier
+# ── Robust imports for both flat and package layouts ─────────────────────── #
+_THIS_DIR   = os.path.abspath(os.path.dirname(__file__))
+_PARENT_DIR = os.path.abspath(os.path.join(_THIS_DIR, os.pardir))
+for _p in (_THIS_DIR, _PARENT_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+try:
+    from models.xlm_roberta_model import XLMRobertaFakeNewsClassifier
+    from models.muril_model import MuRILFakeNewsClassifier
+    from models.ensemble_model import EnsembleFakeNewsClassifier
+except ModuleNotFoundError:
+    from xlm_roberta_model import XLMRobertaFakeNewsClassifier  # noqa: E402
+    from muril_model import MuRILFakeNewsClassifier              # noqa: E402
+    from ensemble_model import EnsembleFakeNewsClassifier        # noqa: E402
 
 
 # ── Constants ────────────────────────────────────────────────────────────── #
@@ -72,30 +84,36 @@ def _resolve_model_type(checkpoint_path: str, explicit_type: str = None) -> str:
     return "xlm-roberta"   # safe default
 
 
-def _extract_state_dict(ckpt) -> dict:
-    """Pull model weights out of any checkpoint format."""
-    if not isinstance(ckpt, dict):
+# ── Checkpoint helpers — shared via utils.checkpoint ────────────────────── #
+try:
+    from utils.checkpoint import extract_state_dict as _extract_state_dict
+    from utils.checkpoint import strip_module_prefix as _strip_module_prefix
+    from utils.checkpoint import safe_load as _safe_load
+except ImportError:
+    # Flat layout fallback (utils/ not on path yet — define inline)
+    def _extract_state_dict(ckpt) -> dict:
+        if not isinstance(ckpt, dict):
+            return ckpt
+        for key in ("model_state_dict", "state_dict", "model"):
+            if key in ckpt and isinstance(ckpt[key], dict):
+                return ckpt[key]
         return ckpt
-    for key in ("model_state_dict", "state_dict", "model"):
-        if key in ckpt and isinstance(ckpt[key], dict):
-            return ckpt[key]
-    return ckpt
 
+    def _strip_module_prefix(state_dict: dict) -> dict:
+        if any(k.startswith("module.") for k in state_dict):
+            return {k[len("module."):]: v for k, v in state_dict.items()}
+        return state_dict
 
-def _strip_module_prefix(state_dict: dict) -> dict:
-    if any(k.startswith("module.") for k in state_dict):
-        return {k[len("module."):]: v for k, v in state_dict.items()}
-    return state_dict
-
-
-def _safe_load(model, state_dict: dict) -> None:
-    state_dict = _strip_module_prefix(state_dict)
-    try:
-        model.load_state_dict(state_dict)
-        print("  Weights loaded (strict=True).")
-    except RuntimeError as e:
-        print(f"  Strict load failed ({e}). Retrying with strict=False.")
-        model.load_state_dict(state_dict, strict=False)
+    def _safe_load(model, state_dict: dict, verbose: bool = True) -> None:
+        state_dict = _strip_module_prefix(state_dict)
+        try:
+            model.load_state_dict(state_dict)
+            if verbose:
+                print("  Weights loaded (strict=True).")
+        except RuntimeError as e:
+            if verbose:
+                print(f"  Strict load failed ({e}). Retrying with strict=False.")
+            model.load_state_dict(state_dict, strict=False)
 
 
 # ════════════════════════════════════════════════════════════════════════════ #
@@ -180,17 +198,37 @@ class FakeNewsDetector:
     def _build_ensemble(self, ckpt_path: str):
         """
         Build ensemble from a combined checkpoint.
-        The checkpoint must have been saved by EnsembleFakeNewsClassifier.save().
+        Reads ensemble_method from checkpoint metadata so the correct
+        architecture (with or without ensemble_fc) is constructed before
+        loading weights — prevents silent weight mismatch with strict=False.
         """
+        ckpt = torch.load(ckpt_path, map_location=self.device)
+        state_dict = _extract_state_dict(ckpt)
+
+        # Detect ensemble_method — same priority order as eval_and_vis / inference
+        ensemble_method = None
+        if isinstance(ckpt, dict):
+            if "ensemble_method" in ckpt:
+                ensemble_method = ckpt["ensemble_method"]
+            if ensemble_method is None:
+                cfg = ckpt.get("config", {}) or {}
+                ensemble_method = cfg.get("ensemble_method")
+        if ensemble_method is None:
+            if any(k.startswith("ensemble_fc") for k in state_dict):
+                ensemble_method = "learned"
+            else:
+                ensemble_method = "weighted_avg"
+        print(f"  Ensemble method: {ensemble_method}")
+
         xlmr  = XLMRobertaFakeNewsClassifier().to(self.device)
         muril = MuRILFakeNewsClassifier().to(self.device)
         ensemble = EnsembleFakeNewsClassifier(
             xlmr_model=xlmr,
             muril_model=muril,
             num_classes=2,
+            ensemble_method=ensemble_method,
         ).to(self.device)
-        ckpt = torch.load(ckpt_path, map_location=self.device)
-        _safe_load(ensemble, _extract_state_dict(ckpt))
+        _safe_load(ensemble, state_dict)
         return ensemble
 
     def predict(self, text: str, show_details: bool = True) -> dict:
@@ -415,11 +453,7 @@ Examples:
 
     args = parser.parse_args()
 
-    # Validate checkpoint
-    if not os.path.exists(args.checkpoint):
-        print(f"  Error: checkpoint '{args.checkpoint}' not found.")
-        print("  Train first with: python train.py")
-        sys.exit(1)
+    # The detector will validate the checkpoint path and perform fuzzy matching if needed.
 
     # Load detector
     try:

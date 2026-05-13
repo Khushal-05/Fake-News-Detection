@@ -27,7 +27,6 @@ import warnings
 
 import pandas as pd
 import numpy as np
-from langdetect import detect
 from sklearn.model_selection import train_test_split
 
 
@@ -54,7 +53,8 @@ class DataPreprocessor:
     def __init__(self):
         self.supported_languages = [
             'hi', 'en', 'ur', 'bn', 'ta', 'pa', 'mr', 'gu', 'as', 'ml',
-            'pn',   # alias kept for backwards compatibility with existing data
+            # 'pn' removed — not a valid ISO 639-1 code; langdetect uses 'pa'
+            # for Punjabi, which is already in this list.
         ]
 
     # ── Text cleaning ─────────────────────────────────────────────────────── #
@@ -104,10 +104,17 @@ class DataPreprocessor:
         """
         Detect language code from text.
         Returns the detected code if it is in supported_languages, else 'unknown'.
+
+        FIX (BUG-11): langdetect is now imported lazily inside the method so that
+        a missing langdetect package does not prevent the entire preprocessing
+        module from loading (consistent with how inference.py and test.py handle it).
         """
         try:
+            from langdetect import detect   # lazy import — degrades gracefully
             lang = detect(str(text))
             return lang if lang in self.supported_languages else 'unknown'
+        except ImportError:
+            return 'unknown'
         except Exception:
             return 'unknown'
 
@@ -270,7 +277,20 @@ class DataPreprocessor:
         )
 
         # Second split: train vs val
+        # Re-run the rare-stratum filter on the train+val subset, because
+        # strata that had exactly 2 samples in the full dataset may now have
+        # only 1 sample after the first split — train_test_split would raise
+        # ValueError if stratify contains a class with < 2 members.
         if stratify_by_language:
+            tv_strat = train_val_df['_stratify']
+            tv_counts = tv_strat.value_counts()
+            tv_rare = tv_counts[tv_counts < 2].index.tolist()
+            if tv_rare:
+                warnings.warn(
+                    f"After train/test split, dropping {train_val_df['_stratify'].isin(tv_rare).sum()} "
+                    f"rows from train+val with < 2 samples in strata: {tv_rare}"
+                )
+                train_val_df = train_val_df[~train_val_df['_stratify'].isin(tv_rare)]
             stratify_train = train_val_df['_stratify']
         else:
             stratify_train = train_val_df['label']

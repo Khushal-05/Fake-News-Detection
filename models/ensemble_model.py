@@ -40,7 +40,8 @@ class EnsembleFakeNewsClassifier(nn.Module):
             weights=[0.4, 0.6],   # favour MuRIL for Indian-language data
         )
 
-        logits = ensemble(input_ids, attention_mask, token_type_ids)
+        logits = ensemble(xlmr_input_ids, xlmr_attention_mask,
+                          muril_input_ids, muril_attention_mask, muril_token_type_ids)
     """
 
     VALID_METHODS = {'weighted_avg', 'max', 'learned'}
@@ -52,7 +53,7 @@ class EnsembleFakeNewsClassifier(nn.Module):
         num_classes: int = 2,
         ensemble_method: str = 'weighted_avg',
         weights: list[float] | None = None,
-        freeze_base_models: bool = True,
+        freeze_base_models: bool = False,
         use_gradient_checkpointing: bool = False,
     ):
         """
@@ -298,9 +299,12 @@ class EnsembleFakeNewsClassifier(nn.Module):
                 "ensemble_fc_frozen":    ensemble_fc_f,
             }
 
-        # FIX: was double-counting ensemble_fc by iterating parameters() inline
+        # FIX (BUG-8): ensemble_fc_f was computed but never added to total_f.
+        # ensemble_fc_f is normally 0 (FC is always trainable) but adding it
+        # makes the count correct even if someone freezes it manually.
+        ensemble_fc_f_val = ensemble_fc_f if self.ensemble_method == 'learned' else 0
         total_t = xlmr_t  + muril_t  + ensemble_fc_t
-        total_f = xlmr_f  + muril_f
+        total_f = xlmr_f  + muril_f  + ensemble_fc_f_val
 
         return {
             "xlmr_trainable":  xlmr_t,
@@ -449,9 +453,12 @@ def train_one_epoch(
 
     Args:
         model:          EnsembleFakeNewsClassifier (set to train mode internally).
-        dataloader:     Yields dicts with keys:
-                            'input_ids', 'attention_mask', 'labels'
-                        and optionally 'token_type_ids' (used by MuRIL only).
+        dataloader:     Yields dicts with keys (from MultilingualFakeNewsDataset
+                        in ensemble mode):
+                            'xlmr_ids', 'xlmr_mask'   — XLM-RoBERTa tokens
+                            'muril_ids', 'muril_mask'  — MuRIL tokens
+                            'muril_tti'                — MuRIL token_type_ids
+                            'label'                    — integer class label
         optimizer:      From build_optimizer_and_scheduler().
         scheduler:      LR scheduler.
         device:         torch.device.
@@ -462,7 +469,7 @@ def train_one_epoch(
     """
     model.train()
 
-    # FIX: loss function must match the output space of forward():
+    # Loss function matches the output space of forward():
     #   weighted_avg / max  → log-probabilities → NLLLoss
     #   learned             → raw logits        → CrossEntropyLoss
     if model.ensemble_method == 'learned':
@@ -473,14 +480,17 @@ def train_one_epoch(
     total_loss, total_correct, total_samples = 0.0, 0, 0
 
     for batch in dataloader:
-        input_ids      = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels         = batch["labels"].to(device)
-        token_type_ids = batch.get("token_type_ids")
-        if token_type_ids is not None:
-            token_type_ids = token_type_ids.to(device)
+        # Unpack dual-tokenization batch produced by MultilingualFakeNewsDataset
+        xlmr_ids  = batch["xlmr_ids"].to(device)
+        xlmr_mask = batch["xlmr_mask"].to(device)
+        muril_ids = batch["muril_ids"].to(device)
+        muril_mask = batch["muril_mask"].to(device)
+        muril_tti  = batch.get("muril_tti")
+        if muril_tti is not None:
+            muril_tti = muril_tti.to(device)
+        labels = batch["label"].to(device)   # dataset yields "label" (singular)
 
-        logits = model(input_ids, attention_mask, token_type_ids)
+        logits = model(xlmr_ids, xlmr_mask, muril_ids, muril_mask, muril_tti)
         loss   = criterion(logits, labels)
 
         optimizer.zero_grad()
@@ -511,7 +521,9 @@ def evaluate(
 
     Args:
         model:      EnsembleFakeNewsClassifier (set to eval mode internally).
-        dataloader: Same format as train_one_epoch.
+        dataloader: Same format as train_one_epoch — dual-tokenization batches
+                    with keys: xlmr_ids, xlmr_mask, muril_ids, muril_mask,
+                    muril_tti (optional), label.
         device:     torch.device.
 
     Returns:
@@ -519,7 +531,7 @@ def evaluate(
     """
     model.eval()
 
-    # FIX: match loss to output space (same logic as train_one_epoch)
+    # Match loss to output space (same logic as train_one_epoch)
     if model.ensemble_method == 'learned':
         criterion = nn.CrossEntropyLoss()
     else:
@@ -528,14 +540,16 @@ def evaluate(
     total_loss, total_correct, total_samples = 0.0, 0, 0
 
     for batch in dataloader:
-        input_ids      = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels         = batch["labels"].to(device)
-        token_type_ids = batch.get("token_type_ids")
-        if token_type_ids is not None:
-            token_type_ids = token_type_ids.to(device)
+        xlmr_ids  = batch["xlmr_ids"].to(device)
+        xlmr_mask = batch["xlmr_mask"].to(device)
+        muril_ids = batch["muril_ids"].to(device)
+        muril_mask = batch["muril_mask"].to(device)
+        muril_tti  = batch.get("muril_tti")
+        if muril_tti is not None:
+            muril_tti = muril_tti.to(device)
+        labels = batch["label"].to(device)   # dataset yields "label" (singular)
 
-        logits = model(input_ids, attention_mask, token_type_ids)
+        logits = model(xlmr_ids, xlmr_mask, muril_ids, muril_mask, muril_tti)
         loss   = criterion(logits, labels)
 
         preds          = torch.argmax(logits, dim=-1)
@@ -593,14 +607,17 @@ if __name__ == "__main__":
         ).to(device)
 
         B, L = 4, 128
-        ids   = torch.randint(0, 100, (B, L)).to(device)
-        mask  = torch.ones(B, L, dtype=torch.long).to(device)
-        types = torch.zeros(B, L, dtype=torch.long).to(device)
+        # Separate tensors for each sub-model's tokenizer vocabulary
+        xlmr_ids  = torch.randint(0, 100, (B, L)).to(device)
+        xlmr_mask = torch.ones(B, L, dtype=torch.long).to(device)
+        muril_ids = torch.randint(0, 100, (B, L)).to(device)
+        muril_mask = torch.ones(B, L, dtype=torch.long).to(device)
+        muril_tti  = torch.zeros(B, L, dtype=torch.long).to(device)
 
-        logits = ensemble(ids, mask, types)
+        logits = ensemble(xlmr_ids, xlmr_mask, muril_ids, muril_mask, muril_tti)
         print(f"  Logits shape:  {logits.shape}")          # [4, 2]
 
-        probs, preds = ensemble.predict(ids, mask, types)
+        probs, preds = ensemble.predict(xlmr_ids, xlmr_mask, muril_ids, muril_mask, muril_tti)
         print(f"  Predictions:   {preds.tolist()}")
         print(f"  Confidences:   {probs.max(dim=-1).values.tolist()}")
 

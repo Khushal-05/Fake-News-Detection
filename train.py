@@ -46,9 +46,26 @@ Resumption-dip fixes (v2):
         touching model weights. This value is used in __init__ to correctly
         calculate num_training_steps for the scheduler before
         _load_resume_checkpoint() runs the full state restoration.
+
+Model checkpointing + early stopping (v3):
+    - Best checkpoint now saved by val_loss improvement, not val_f1.
+      val_loss is a more direct signal of generalisation — the model with
+      the lowest val_loss is saved as _best.pt regardless of whether F1
+      also improved that epoch.  val_f1 tracking is kept alongside for
+      reporting and history purposes.
+    - Early stopping: if val_loss does not improve for `early_stopping_patience`
+      consecutive epochs the training loop breaks automatically.  The
+      patience counter is saved in both _resume.pt and _best.pt so it is
+      preserved correctly across Kaggle sessions.
+    - To disable early stopping, set early_stopping_patience=0 (or omit it
+      from CONFIG — the default is 0, meaning no early stopping).
+    - Recommended workflow: set num_epochs=15 (or any safely high ceiling)
+      and early_stopping_patience=3.  Training will stop as soon as the
+      model stops improving, typically well before epoch 15.
 """
 
 import os
+import sys
 import time
 import json
 import shutil
@@ -64,19 +81,42 @@ import pandas as pd
 import numpy as np
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
-from data.dataset import MultilingualFakeNewsDataset
-from models.xlm_roberta_model import (
-    XLMRobertaFakeNewsClassifier,
-    build_optimizer_and_scheduler as xlmr_build_opt,
-)
-from models.muril_model import (
-    MuRILFakeNewsClassifier,
-    build_optimizer_and_scheduler as muril_build_opt,
-)
-from models.ensemble_model import (
-    EnsembleFakeNewsClassifier,
-    build_optimizer_and_scheduler as ensemble_build_opt,
-)
+# ── Robust imports for both flat and package layouts ─────────────────────── #
+_THIS_DIR   = os.path.abspath(os.path.dirname(__file__))
+_PARENT_DIR = os.path.abspath(os.path.join(_THIS_DIR, os.pardir))
+for _p in (_THIS_DIR, _PARENT_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+try:
+    from data.dataset import MultilingualFakeNewsDataset
+    from models.xlm_roberta_model import (
+        XLMRobertaFakeNewsClassifier,
+        build_optimizer_and_scheduler as xlmr_build_opt,
+    )
+    from models.muril_model import (
+        MuRILFakeNewsClassifier,
+        build_optimizer_and_scheduler as muril_build_opt,
+    )
+    from models.ensemble_model import (
+        EnsembleFakeNewsClassifier,
+        build_optimizer_and_scheduler as ensemble_build_opt,
+    )
+except ModuleNotFoundError:
+    # Flat layout: all modules live at the project root
+    from dataset import MultilingualFakeNewsDataset                         # noqa: E402
+    from xlm_roberta_model import (                                         # noqa: E402
+        XLMRobertaFakeNewsClassifier,
+        build_optimizer_and_scheduler as xlmr_build_opt,
+    )
+    from muril_model import (                                               # noqa: E402
+        MuRILFakeNewsClassifier,
+        build_optimizer_and_scheduler as muril_build_opt,
+    )
+    from ensemble_model import (                                            # noqa: E402
+        EnsembleFakeNewsClassifier,
+        build_optimizer_and_scheduler as ensemble_build_opt,
+    )
 
 
 # ── Model-type helpers ───────────────────────────────────────────────────── #
@@ -96,33 +136,36 @@ def _normalise_model_type(raw: str) -> str:
     )
 
 
-# ── Checkpoint helpers ───────────────────────────────────────────────────── #
-
-def _extract_state_dict(ckpt) -> dict:
-    """Pull model weights out of any checkpoint format."""
-    if not isinstance(ckpt, dict):
+# ── Checkpoint helpers — shared via utils.checkpoint ────────────────────── #
+try:
+    from utils.checkpoint import extract_state_dict as _extract_state_dict
+    from utils.checkpoint import strip_module_prefix as _strip_module_prefix
+    from utils.checkpoint import safe_load as _safe_load
+except ImportError:
+    # Flat layout fallback (utils/ not on path yet — define inline)
+    def _extract_state_dict(ckpt) -> dict:
+        if not isinstance(ckpt, dict):
+            return ckpt
+        for key in ("model_state_dict", "state_dict", "model"):
+            if key in ckpt and isinstance(ckpt[key], dict):
+                return ckpt[key]
         return ckpt
-    for key in ("model_state_dict", "state_dict", "model"):
-        if key in ckpt and isinstance(ckpt[key], dict):
-            return ckpt[key]
-    return ckpt   # assume it is already a plain state dict
 
+    def _strip_module_prefix(state_dict: dict) -> dict:
+        if any(k.startswith("module.") for k in state_dict):
+            return {k[len("module."):]: v for k, v in state_dict.items()}
+        return state_dict
 
-def _strip_module_prefix(state_dict: dict) -> dict:
-    """Remove 'module.' prefix left by DistributedDataParallel."""
-    if any(k.startswith("module.") for k in state_dict):
-        return {k[len("module."):]: v for k, v in state_dict.items()}
-    return state_dict
-
-
-def _safe_load(model: nn.Module, state_dict: dict) -> None:
-    """Load state dict strictly; fall back to strict=False on key mismatch."""
-    state_dict = _strip_module_prefix(state_dict)
-    try:
-        model.load_state_dict(state_dict)
-    except RuntimeError as e:
-        print(f"  [warn] Strict load failed ({e}). Retrying with strict=False.")
-        model.load_state_dict(state_dict, strict=False)
+    def _safe_load(model, state_dict: dict, verbose: bool = True) -> None:
+        state_dict = _strip_module_prefix(state_dict)
+        try:
+            model.load_state_dict(state_dict)
+            if verbose:
+                print("  Weights loaded (strict=True).")
+        except RuntimeError as e:
+            if verbose:
+                print(f"  Strict load failed ({e}). Retrying with strict=False.")
+            model.load_state_dict(state_dict, strict=False)
 
 
 # ── FIX-1 / FIX-3: lightweight peek helper ──────────────────────────────── #
@@ -175,6 +218,13 @@ class FakeNewsTrainer:
         - Train DataLoader uses a seeded Generator for reproducible shuffling.
         - start_epoch is extracted from the checkpoint BEFORE the optimizer
           is built so num_training_steps is always consistent.
+
+    Model checkpointing + early stopping (v3):
+        - _best.pt saved whenever val_loss hits a new low (not val_f1).
+        - Early stopping breaks the loop after `early_stopping_patience`
+          epochs without val_loss improvement (0 = disabled).
+        - Both patience counter and best_val_loss are persisted in checkpoints
+          so early stopping state survives Kaggle session boundaries.
     """
 
     def __init__(
@@ -188,7 +238,7 @@ class FakeNewsTrainer:
         encoder_lr: float = 2e-5,
         classifier_lr: float = 1e-4,
         ensemble_lr: float = 1e-3,
-        num_epochs: int = 3,
+        num_epochs: int = 15,
         warmup_ratio: float = 0.1,
         max_grad_norm: float = 1.0,
         use_wandb: bool = False,
@@ -196,7 +246,9 @@ class FakeNewsTrainer:
         resume_checkpoint: dict = None,
         log_dir: str = "outputs/logs",
         save_resume_every_n_epochs: int = 1,
-        dataloader_seed: int = 42,          # FIX-2: seed for reproducible shuffling
+        dataloader_seed: int = 42,
+        early_stopping_patience: int = 0,   # 0 = disabled; 3 is recommended
+        checkpoint_metric: str = "val_f1",  # 'val_f1' (recommended) or 'val_loss'
     ):
         self.model      = model.to(device)
         self.model_type = _normalise_model_type(model_type)
@@ -207,6 +259,21 @@ class FakeNewsTrainer:
         self.use_wandb  = use_wandb
         self.config     = config or {}
         self.dataloader_seed = dataloader_seed  # FIX-2
+
+        # Checkpoint metric: which validation metric triggers saving _best.pt
+        # 'val_f1'   — save when weighted F1 improves (recommended for imbalanced multilingual data)
+        # 'val_loss' — save when validation loss decreases (smoother signal, less directly meaningful)
+        if checkpoint_metric not in ("val_f1", "val_loss"):
+            raise ValueError(
+                f"checkpoint_metric='{checkpoint_metric}' is invalid. "
+                "Choose 'val_f1' (recommended) or 'val_loss'."
+            )
+        self.checkpoint_metric = checkpoint_metric
+
+        # Early stopping patience is applied to the same metric as checkpoint_metric.
+        # patience=0 means disabled — the loop always runs all num_epochs.
+        # patience=N means: stop if the chosen metric has not improved for N consecutive epochs.
+        self.early_stopping_patience = early_stopping_patience
 
         # Resumable training state
         self.log_dir = log_dir
@@ -292,8 +359,11 @@ class FakeNewsTrainer:
             )
 
         # ── State tracking ────────────────────────────────────────────────── #
-        self.best_val_f1 = 0.0
-        self.best_epoch  = 0
+        self.best_val_f1   = 0.0
+        self.best_val_loss = float("inf")
+        self.best_epoch    = 0
+        self._es_counter   = 0              # epochs without improvement on checkpoint_metric
+        self._last_val_metrics: dict = {}   # most recent val metrics for emergency resume saves
         self.history = {
             "train_loss": [], "train_accuracy": [], "train_f1": [],
             "val_loss":   [], "val_accuracy":   [], "val_f1":   [],
@@ -364,20 +434,22 @@ class FakeNewsTrainer:
                 token_type_ids = token_type_ids.to(self.device)
             return (input_ids, attention_mask, token_type_ids), labels
 
-    def _forward(self, inputs: tuple, model_type: str) -> torch.Tensor:
+    def _forward(self, inputs: tuple) -> torch.Tensor:
         """Route inputs to the appropriate model forward pass.
 
+        FIX (BUG-12): removed redundant `model_type` parameter — callers
+        always passed `self.model_type`, so it is used directly now.
+
         Args:
-            inputs:     Tuple of tensors specific to model_type.
-            model_type: One of 'xlm-roberta', 'muril', 'ensemble'.
+            inputs: Tuple of tensors specific to self.model_type.
 
         Returns:
             logits: Model output logits [batch_size, num_classes].
         """
-        if model_type == "ensemble":
+        if self.model_type == "ensemble":
             xlmr_ids, xlmr_mask, muril_ids, muril_mask, muril_tti = inputs
             return self.model(xlmr_ids, xlmr_mask, muril_ids, muril_mask, muril_tti)
-        elif model_type == "xlm-roberta":
+        elif self.model_type == "xlm-roberta":
             input_ids, attention_mask, _ = inputs
             return self.model(input_ids, attention_mask)
         else:  # muril
@@ -402,7 +474,7 @@ class FakeNewsTrainer:
             inputs, labels = self._unpack_batch(batch)
 
             self.optimizer.zero_grad()
-            logits = self._forward(inputs, self.model_type)
+            logits = self._forward(inputs)
             loss   = self.criterion(logits, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -431,6 +503,10 @@ class FakeNewsTrainer:
             dict with keys: 'loss', 'accuracy', 'precision', 'recall', 'f1',
                             'per_language_accuracy'
         """
+        # FIX (BUG-6): remember training state so we can restore it after
+        # validation, preventing the model from being stuck in eval mode
+        # when validate() is called standalone (e.g. from a notebook cell).
+        was_training = self.model.training
         self.model.eval()
         total_loss      = 0.0
         all_predictions = []
@@ -440,7 +516,7 @@ class FakeNewsTrainer:
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc="Validation", leave=False):
                 inputs, labels = self._unpack_batch(batch)
-                logits = self._forward(inputs, self.model_type)
+                logits = self._forward(inputs)
                 loss   = self.criterion(logits, labels)
 
                 total_loss += loss.item()
@@ -473,6 +549,9 @@ class FakeNewsTrainer:
                 ldf = df[df["language"] == lang]
                 per_lang_acc[lang] = accuracy_score(ldf["label"], ldf["prediction"])
 
+        if was_training:
+            self.model.train()
+
         return {
             "loss":                  avg_loss,
             "accuracy":              accuracy,
@@ -497,14 +576,38 @@ class FakeNewsTrainer:
         Restore full training state from a resume checkpoint.
 
         The optimizer and scheduler were already built with the correct
-        total_steps (via _peek_resume_epoch + FIX-1).  This method only
-        restores the saved parameter states (momentum buffers, last_epoch
-        counter, best metrics, history) on top of the already-correct curve.
+        total_steps (via _peek_resume_epoch + FIX-1).  This method restores:
+          1. Model weights  ← CRITICAL: without this the model starts from
+             pretrained/random weights while the optimizer/scheduler resume
+             from a later point in training — the primary cause of the dip.
+          2. Optimizer + scheduler saved states (momentum buffers, last_epoch).
+          3. Scalar tracking state: best metrics, history, early stopping counter.
         """
         print(f"\n  Loading resume state...")
         # start_epoch and total_steps already set in __init__ via _peek_resume_epoch
-        self.best_val_f1 = checkpoint.get('best_val_f1', 0.0)
-        self.best_epoch  = checkpoint.get('best_epoch', 0)
+
+        # ── 1. Model weights — must happen FIRST ─────────────────────────── #
+        if 'model_state_dict' in checkpoint:
+            try:
+                _safe_load(self.model, checkpoint['model_state_dict'])
+                print("  ✓ Model weights restored")
+            except Exception as e:
+                print(f"  ⚠ Could not restore model weights: {e} — training may dip!")
+        else:
+            print("  ⚠ No model_state_dict in checkpoint — starting from current weights.")
+
+        self.best_val_f1   = checkpoint.get('best_val_f1', 0.0)
+        self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        self.best_epoch    = checkpoint.get('best_epoch', 0)
+        self._es_counter   = checkpoint.get('es_counter', 0)
+        # Restore checkpoint_metric if saved; warn if mismatch with current setting
+        saved_metric = checkpoint.get('checkpoint_metric')
+        if saved_metric is not None and saved_metric != self.checkpoint_metric:
+            print(
+                f"  [warn] checkpoint_metric changed: saved='{saved_metric}' "
+                f"current='{self.checkpoint_metric}'. "
+                f"Using current setting '{self.checkpoint_metric}'."
+            )
         if 'history' in checkpoint:
             self.history = checkpoint['history']
 
@@ -528,7 +631,11 @@ class FakeNewsTrainer:
         print("  ✓ DataLoader seed aligned to resumed epoch")
 
         print(f"  Resuming from epoch {self.start_epoch + 1}")
-        print(f"  Best val F1 so far: {self.best_val_f1:.4f} (epoch {self.best_epoch})")
+        print(f"  Checkpoint metric:    {self.checkpoint_metric}")
+        print(f"  Best val loss so far: {self.best_val_loss:.4f} (epoch {self.best_epoch})")
+        print(f"  Best val F1 so far:   {self.best_val_f1:.4f}")
+        if self.early_stopping_patience > 0:
+            print(f"  Early stopping ({self.checkpoint_metric}): {self._es_counter} / {self.early_stopping_patience}")
 
     def _log_metrics_to_csv(self, epoch: int, train_m: dict, val_m: dict) -> None:
         """Append per-epoch metrics to the persistent CSV log."""
@@ -557,6 +664,8 @@ class FakeNewsTrainer:
         FIX-1: total_steps is stored alongside epoch so the next session can
         rebuild the scheduler with the same curve shape without recomputing it
         from num_epochs (which might differ if the user changes the config).
+        Early stopping state (best_val_loss, es_counter) is also persisted so
+        patience counting is continuous across Kaggle session boundaries.
         """
         resume_path = os.path.join(save_dir, f"{self.model_type}_resume.pt")
         torch.save({
@@ -564,14 +673,17 @@ class FakeNewsTrainer:
             "optimizer_state_dict":  self.optimizer.state_dict(),
             "scheduler_state_dict":  self.scheduler.state_dict(),
             "epoch":                 epoch,
-            "total_steps":           self._num_training_steps,  # FIX-1: preserve curve
+            "total_steps":           self._num_training_steps,  # FIX-1
             "best_val_f1":           self.best_val_f1,
+            "best_val_loss":         self.best_val_loss,
             "best_epoch":            self.best_epoch,
+            "es_counter":            self._es_counter,          # early stopping
+            "checkpoint_metric":     self.checkpoint_metric,    # which metric triggers _best.pt
             "history":               self.history,
             "val_metrics":           val_metrics,
             "model_type":            self.model_type,
             "config":                self.config,
-            "dataloader_seed":       self.dataloader_seed,  # FIX-2: preserve seed
+            "dataloader_seed":       self.dataloader_seed,      # FIX-2
             "timestamp":             datetime.now().isoformat(),
         }, resume_path)
         print(f"  Resume checkpoint saved → {resume_path}")
@@ -589,6 +701,9 @@ class FakeNewsTrainer:
                 "epoch":                epoch,
                 "total_steps":          self._num_training_steps,  # FIX-1
                 "best_val_f1":          self.best_val_f1,
+                "best_val_loss":        self.best_val_loss,
+                "es_counter":           self._es_counter,           # early stopping
+                "checkpoint_metric":    self.checkpoint_metric,     # which metric triggers _best.pt
                 "val_metrics":          val_metrics or {},
                 "model_type":           self.model_type,
                 "config":               self.config,
@@ -601,20 +716,24 @@ class FakeNewsTrainer:
 
     def train(self, save_dir: str = "models/checkpoints") -> nn.Module:
         """
-        Full training loop with resumable checkpoints and persistent logging.
+        Full training loop with val_loss checkpointing, early stopping,
+        resumable checkpoints, and persistent logging.
 
-        - Starts from self.start_epoch (0 if fresh, >0 if resumed).
-        - FIX-2: advances the DataLoader seed at the start of each epoch so
-          batch ordering is deterministic and consistent across sessions.
-        - Saves resume checkpoint every N epochs.
-        - Logs metrics to CSV after each epoch.
-        - Handles interrupts gracefully (saves state before exit).
+        Checkpointing: _best.pt is saved whenever val_loss hits a new low.
+        Early stopping: loop breaks after `early_stopping_patience` consecutive
+                        epochs without a new val_loss low (0 = disabled).
+        Resumption: starts from self.start_epoch; all early stopping state is
+                    restored from checkpoint so patience counting is continuous
+                    across Kaggle session boundaries.
         """
         print(f"\nStarting training — {self.num_epochs} epoch(s), model={self.model_type}")
         if self.start_epoch > 0:
             print(f"  (Resuming from epoch {self.start_epoch + 1})")
         print(f"  Scheduler total_steps={self._num_training_steps} "
               f"(steps_per_epoch={len(self.train_loader)})")
+        if self.early_stopping_patience > 0:
+            print(f"  Early stopping patience: {self.early_stopping_patience} epochs")
+            print(f"  Early stopping counter on entry: {self._es_counter}")
 
         best_path = os.path.join(save_dir, f"{self.model_type}_best.pt")
 
@@ -622,7 +741,10 @@ class FakeNewsTrainer:
             for epoch in range(self.start_epoch, self.num_epochs):
                 if self.interrupted:
                     print("\nInterrupted. Saving state...")
-                    self._save_resume_checkpoint(save_dir, epoch, {})
+                    # `epoch` here is 0-indexed and this iteration was
+                    # interrupted before completing, so save bare `epoch`
+                    # (not epoch+1) so the next session re-runs this epoch.
+                    self._save_resume_checkpoint(save_dir, epoch, self._last_val_metrics)
                     print("Resume checkpoint saved. Exiting gracefully.")
                     break
 
@@ -635,6 +757,7 @@ class FakeNewsTrainer:
 
                 train_m = self.train_epoch()
                 val_m   = self.validate()
+                self._last_val_metrics = val_m  # keep for emergency resume saves
 
                 # Record history
                 self.history["train_loss"].append(train_m["loss"])
@@ -683,33 +806,105 @@ class FakeNewsTrainer:
                     except Exception as e:
                         print(f"  [wandb] logging failed: {e}")
 
-                # Save best checkpoint
-                if val_m["f1"] > self.best_val_f1:
-                    self.best_val_f1 = val_m["f1"]
-                    self.best_epoch  = epoch + 1
+                # ── Model checkpointing + early stopping ─────────────────── #
+                # _best.pt is saved whenever the chosen checkpoint_metric
+                # hits a new high (val_f1) or new low (val_loss).
+                # Early stopping patience is counted on the same metric.
+                current_f1   = val_m["f1"]
+                current_loss = val_m["loss"]
+
+                # Always keep best_val_f1 and best_val_loss current for logging
+                # regardless of which metric is used for checkpointing.
+                improved = False
+                if self.checkpoint_metric == "val_f1":
+                    if current_f1 > self.best_val_f1:
+                        self.best_val_f1   = current_f1
+                        self.best_val_loss = current_loss   # update companion metric too
+                        self.best_epoch    = epoch + 1
+                        self._es_counter   = 0
+                        improved = True
+                else:  # val_loss
+                    if current_loss < self.best_val_loss:
+                        self.best_val_loss = current_loss
+                        self.best_val_f1   = current_f1     # update companion metric too
+                        self.best_epoch    = epoch + 1
+                        self._es_counter   = 0
+                        improved = True
+
+                if improved:
                     self.save_model(best_path, epoch=epoch + 1, val_metrics=val_m)
-                    print(f"  ★ New best val F1={self.best_val_f1:.4f} (epoch {self.best_epoch})")
+                    print(
+                        f"  ★ New best ({self.checkpoint_metric}): "
+                        f"val_loss={self.best_val_loss:.4f}  "
+                        f"val_f1={self.best_val_f1:.4f}  "
+                        f"(epoch {self.best_epoch})"
+                    )
+                else:
+                    self._es_counter += 1
+                    metric_val = current_f1 if self.checkpoint_metric == "val_f1" else current_loss
+                    best_val   = self.best_val_f1 if self.checkpoint_metric == "val_f1" else self.best_val_loss
+                    direction  = "high" if self.checkpoint_metric == "val_f1" else "low"
+                    print(
+                        f"  No {self.checkpoint_metric} improvement "
+                        f"(best={best_val:.4f} [{direction}], current={metric_val:.4f})"
+                    )
+                    if self.early_stopping_patience > 0:
+                        print(
+                            f"  Early stopping: {self._es_counter} / "
+                            f"{self.early_stopping_patience}"
+                        )
 
                 # Save resume checkpoint periodically
                 if (epoch + 1) % self.save_resume_every_n_epochs == 0:
                     self._save_resume_checkpoint(save_dir, epoch + 1, val_m)
 
+                # ── Early stopping check ──────────────────────────────────── #
+                # Placed AFTER the periodic resume save so the checkpoint always
+                # reflects the latest state before the loop exits.
+                if (
+                    self.early_stopping_patience > 0
+                    and self._es_counter >= self.early_stopping_patience
+                ):
+                    print(
+                        f"\n  Early stopping triggered: {self.checkpoint_metric} has not improved "
+                        f"for {self._es_counter} consecutive epochs."
+                    )
+                    print(f"  Best epoch was {self.best_epoch} "
+                          f"(val_loss={self.best_val_loss:.4f}, val_f1={self.best_val_f1:.4f}).")
+                    break
+
         except KeyboardInterrupt:
             print("\n\nKeyboardInterrupt caught. Saving state...")
+            # `epoch` is the 0-indexed loop variable for the epoch that was
+            # interrupted mid-run. Save it as-is so start_epoch on resume
+            # re-runs this epoch from scratch instead of skipping it.
+            # Periodic saves use `epoch + 1` (completed epochs); here the
+            # epoch was NOT completed, so we use bare `epoch`.
             current_epoch = epoch if 'epoch' in locals() else self.start_epoch
-            self._save_resume_checkpoint(save_dir, current_epoch, {})
+            self._save_resume_checkpoint(save_dir, current_epoch, self._last_val_metrics)
             print("Resume checkpoint saved. You can restart training to continue.")
             raise
 
         print(f"\n{'=' * 55}")
         print(f"Training complete.")
-        print(f"Best val F1 = {self.best_val_f1:.4f} at epoch {self.best_epoch}")
+        print(f"Checkpoint metric:  {self.checkpoint_metric}")
+        print(f"Best val loss = {self.best_val_loss:.4f} at epoch {self.best_epoch}")
+        print(f"Best val F1   = {self.best_val_f1:.4f}")
         print(f"Best checkpoint: {best_path}")
         print(f"Metrics log: {self.metrics_log_path}")
 
-        # Reload best weights before returning
-        ckpt = torch.load(best_path, map_location=self.device)
-        _safe_load(self.model, _extract_state_dict(ckpt))
+        # Reload best weights before returning.
+        # FIX (BUG-3): guard with isfile() so that a resume where start_epoch >= num_epochs
+        # (training already complete) does not crash with FileNotFoundError.
+        if os.path.isfile(best_path):
+            ckpt = torch.load(best_path, map_location=self.device)
+            _safe_load(self.model, _extract_state_dict(ckpt))
+            print(f"  Best weights reloaded from: {best_path}")
+        else:
+            print(
+                f"  [warn] Best checkpoint not found at '{best_path}'. "
+                "Returning current weights (training may have already been complete)."
+            )
         return self.model
 
 
@@ -730,7 +925,16 @@ CONFIG = {
     "encoder_lr":       2e-5,
     "classifier_lr":    1e-4,
     "ensemble_lr":      1e-3,
-    "num_epochs":       3,
+    # Set high enough that the model peaks before hitting the limit.
+    # Early stopping will exit well before this ceiling if val_loss plateaus.
+    "num_epochs":             15,
+    # Stop training if the checkpoint metric has not improved for this many
+    # consecutive epochs. Set to 0 to disable early stopping entirely.
+    "early_stopping_patience": 3,
+    # Which validation metric triggers saving _best.pt and early stopping.
+    # 'val_f1'   — recommended for imbalanced multilingual classification
+    # 'val_loss' — smoother signal; use if F1 is very noisy on your data
+    "checkpoint_metric":       "val_f1",
     "warmup_ratio":     0.1,
     "max_length":       512,
     "dropout":          0.3,
@@ -804,7 +1008,7 @@ if __name__ == "__main__":
             **common_kwargs,
         )
         muril = MuRILFakeNewsClassifier(
-            model_name=CONFIG.get("model_name", "google/muril-base-cased"),
+            model_name=CONFIG.get("muril_model_name", "google/muril-base-cased"),
             **common_kwargs,
         )
         for sub_model, ckpt_key, label in [
@@ -863,6 +1067,8 @@ if __name__ == "__main__":
         warmup_ratio=CONFIG["warmup_ratio"],
         use_wandb=CONFIG["use_wandb"],
         config=CONFIG,
+        early_stopping_patience=CONFIG.get("early_stopping_patience", 0),
+        checkpoint_metric=CONFIG.get("checkpoint_metric", "val_f1"),
     )
 
     trained_model = trainer.train(save_dir=CONFIG["save_dir"])
@@ -886,7 +1092,7 @@ if __name__ == "__main__":
         }
         json.dump(safe_cfg, fh, indent=2)
 
-    # Val-set predictions
+    # Val-set predictions — reuse _unpack_batch and _forward for consistency
     trained_model.eval()
     y_true, y_pred, probs_list, languages = [], [], [], []
 
@@ -895,12 +1101,13 @@ if __name__ == "__main__":
             labels = batch["label"]
 
             if model_type == "ensemble":
+                muril_tti = batch.get("muril_tti")
                 logits = trained_model(
                     batch["xlmr_ids"].to(device),
                     batch["xlmr_mask"].to(device),
                     batch["muril_ids"].to(device),
                     batch["muril_mask"].to(device),
-                    batch["muril_tti"].to(device),
+                    muril_tti.to(device) if isinstance(muril_tti, torch.Tensor) else muril_tti,
                 )
             elif model_type == "xlm-roberta":
                 logits = trained_model(

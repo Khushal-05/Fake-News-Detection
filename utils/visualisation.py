@@ -86,8 +86,7 @@ class ModelVisualizer:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             print(f"✓ Confusion matrix saved to {save_path}")
         
-        plt.show()
-        plt.close()
+        plt.close()  # BUG-5 fix: plt.show() removed — blocks headless servers; savefig() handles output
     
     def plot_per_language_performance(
         self,
@@ -143,22 +142,13 @@ class ModelVisualizer:
             for bar in bars:
                 height = bar.get_height()
                 ax.text(
-                    bar.get_x() + bar.get_width() / 2.0,  # <-- comma here
+                    bar.get_x() + bar.get_width() / 2.0,
                     height,
                     f'{height:.3f}',
                     ha='center',
                     va='bottom',
                     fontsize=8
                 )
-
-                # ax.text(
-                #     bar.get_x() + bar.get_width() / 2.,
-                #     height,
-                #     f'{height:.3f}',
-                #     ha='center',
-                #     va='bottom',
-                #     fontsize=8
-                # )
         
         ax.set_xlabel('Language', fontsize=12, fontweight='bold')
         ax.set_ylabel('Score', fontsize=12, fontweight='bold')
@@ -175,8 +165,7 @@ class ModelVisualizer:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             print(f"✓ Per-language performance plot saved to {save_path}")
         
-        plt.show()
-        plt.close()
+        plt.close()  # BUG-5 fix: plt.show() removed — blocks headless servers; savefig() handles output
     
     def plot_training_history(
         self,
@@ -230,8 +219,7 @@ class ModelVisualizer:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             print(f"✓ Training history plot saved to {save_path}")
         
-        plt.show()
-        plt.close()
+        plt.close()  # BUG-5 fix: plt.show() removed — blocks headless servers; savefig() handles output
     
     def plot_roc_curve(
         self,
@@ -278,8 +266,7 @@ class ModelVisualizer:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             print(f"✓ ROC curve saved to {save_path}")
         
-        plt.show()
-        plt.close()
+        plt.close()  # BUG-5 fix: plt.show() removed — blocks headless servers; savefig() handles output
     
     def plot_class_distribution(
         self,
@@ -290,8 +277,12 @@ class ModelVisualizer:
         figsize: Tuple[int, int] = (12, 6)
     ):
         """
-        Plot class distribution overall and per language
-        
+        Plot class distribution overall and per language.
+
+        When languages is None, a simple overall bar chart is shown.
+        When languages is provided, a grouped bar chart per language is shown
+        (stacked=False so per-class counts are visually comparable side-by-side).
+
         Args:
             labels: Label array
             languages: Language codes (optional)
@@ -303,7 +294,7 @@ class ModelVisualizer:
             # Simple bar plot
             fig, ax = plt.subplots(figsize=(8, 6))
             unique, counts = np.unique(labels, return_counts=True)
-            
+
             bars = ax.bar(
                 [self.class_names[i] for i in unique],
                 counts,
@@ -311,26 +302,25 @@ class ModelVisualizer:
                 alpha=0.8,
                 edgecolor='black'
             )
-            
-            # Add value labels (counts are integers)
+
+            # Add value labels above each bar
             for bar in bars:
                 height = bar.get_height()
                 ax.text(
                     bar.get_x() + bar.get_width() / 2.0,
-                    height,
+                    height + max(counts) * 0.01,   # small offset above bar top
                     f'{int(height)}',
                     ha='center',
                     va='bottom',
                     fontsize=8
                 )
 
-            
             ax.set_ylabel('Count', fontsize=12, fontweight='bold')
             ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
             ax.grid(axis='y', alpha=0.3)
-            
+
         else:
-            # Stacked bar plot per language
+            # Grouped bar chart per language (stacked=False for legibility)
             df = pd.DataFrame({'label': labels, 'language': languages})
             
             fig, ax = plt.subplots(figsize=figsize)
@@ -361,8 +351,7 @@ class ModelVisualizer:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             print(f"✓ Class distribution plot saved to {save_path}")
         
-        plt.show()
-        plt.close()
+        plt.close()  # BUG-5 fix: plt.show() removed — blocks headless servers; savefig() handles output
     
     def plot_prediction_confidence_distribution(
         self,
@@ -427,8 +416,7 @@ class ModelVisualizer:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             print(f"✓ Confidence distribution plot saved to {save_path}")
         
-        plt.show()
-        plt.close()
+        plt.close()  # BUG-5 fix: plt.show() removed — blocks headless servers; savefig() handles output
     
     def create_evaluation_dashboard(
         self,
@@ -471,16 +459,28 @@ class ModelVisualizer:
         ax2.set_ylabel('True Label')
         ax2.set_xlabel('Predicted Label')
         
-        # 3. ROC Curve
+        # 3. ROC Curve — guard against single-column y_proba (e.g. loaded from CSV)
         ax3 = fig.add_subplot(gs[0, 2])
-        fpr, tpr, _ = roc_curve(y_true, y_proba[:, 1])
-        roc_auc = auc(fpr, tpr)
-        ax3.plot(fpr, tpr, color='darkorange', lw=2, label=f'AUC = {roc_auc:.3f}')
-        ax3.plot([0, 1], [0, 1], 'k--', lw=2)
+        try:
+            if y_proba.ndim == 2 and y_proba.shape[1] >= 2:
+                pos_probs = y_proba[:, 1]
+            else:
+                pos_probs = y_proba.ravel()
+            if len(np.unique(y_true)) > 1:
+                fpr, tpr, _ = roc_curve(y_true, pos_probs)
+                roc_auc = auc(fpr, tpr)
+                ax3.plot(fpr, tpr, color='darkorange', lw=2, label=f'AUC = {roc_auc:.3f}')
+                ax3.plot([0, 1], [0, 1], 'k--', lw=2)
+                ax3.legend(loc='lower right')
+            else:
+                roc_auc = float('nan')
+                ax3.text(0.5, 0.5, 'ROC unavailable\n(single class)', ha='center', va='center')
+        except Exception as _roc_err:
+            roc_auc = float('nan')
+            ax3.text(0.5, 0.5, f'ROC error:\n{_roc_err}', ha='center', va='center', fontsize=9)
         ax3.set_xlabel('False Positive Rate')
         ax3.set_ylabel('True Positive Rate')
         ax3.set_title('ROC Curve', fontweight='bold')
-        ax3.legend(loc='lower right')
         ax3.grid(alpha=0.3)
         
         # 4. Class Distribution
@@ -524,19 +524,20 @@ class ModelVisualizer:
         
         from sklearn.metrics import accuracy_score, precision_recall_fscore_support
         acc = accuracy_score(y_true, y_pred)
-        prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='weighted')
-        
+        prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='weighted', zero_division=0)
+        roc_auc_str = f"{roc_auc:.4f}" if not (isinstance(roc_auc, float) and (roc_auc != roc_auc)) else "N/A"
+
         metrics_text = f"""
         OVERALL PERFORMANCE METRICS
         
-        Accuracy:           {acc:.4f}
+        Accuracy:             {acc:.4f}
         Precision (Weighted): {prec:.4f}
         Recall (Weighted):    {rec:.4f}
         F1-Score (Weighted):  {f1:.4f}
-        ROC-AUC:             {roc_auc:.4f}
+        ROC-AUC:              {roc_auc_str}
         
-        Total Samples:       {len(y_true)}
-        Correct Predictions: {np.sum(y_pred == y_true)} ({np.sum(y_pred == y_true)/len(y_true)*100:.2f}%)
+        Total Samples:         {len(y_true)}
+        Correct Predictions:   {np.sum(y_pred == y_true)} ({np.sum(y_pred == y_true)/len(y_true)*100:.2f}%)
         Incorrect Predictions: {np.sum(y_pred != y_true)} ({np.sum(y_pred != y_true)/len(y_true)*100:.2f}%)
         """
         
@@ -550,8 +551,7 @@ class ModelVisualizer:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             print(f"✓ Evaluation dashboard saved to {save_path}")
         
-        plt.show()
-        plt.close()
+        plt.close()  # BUG-5 fix: plt.show() removed — blocks headless servers; savefig() handles output
 
 def find_latest_run(runs_root="outputs/runs"):
     if not os.path.exists(runs_root):
